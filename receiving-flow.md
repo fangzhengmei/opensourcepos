@@ -576,85 +576,6 @@ delete_list(receiving_ids, employee_id, update_inventory)
 ```
 
 ---
-```php
-// L154
-$items_received = $item_data['receiving_quantity'] != 0 
-    ? $item_data['quantity'] * $item_data['receiving_quantity'] 
-    : $item_data['quantity'];   // ← 当 rq=0 时，兜底用 quantity
-```
-
-**删除时（无兜底）**：
-```php
-// L238 库存变动记录
-'trans_inventory' => $item['quantity_purchased'] * (-$item['receiving_quantity'])
-// L244 库存数量
-$item_quantity->change_quantity(..., 
-    $item['quantity_purchased'] * (-$item['receiving_quantity'])
-);
-// ← 当 rq=0 时，直接乘 0，结果为 0！
-```
-
-#### 5.5.2 receiving_quantity 不同取值范围的行为分析
-
-以 `quantity_purchased = 10` 为例，覆盖所有情况：
-
-| `receiving_quantity` | 保存时库存变化 | 删除时库存变化 | 净变化 | 是否一致？ |
-|---|---|---|---|---|
-| **rq = 0** | `10 * 0 ≠ 0` 为假 → 取兜底 **+10** | `10 × (-0) = 0` | **+10** ❌ | 🔴 **严重不一致** |
-| **0 < rq < 1** (如 0.5) | `10 × 0.5 = +5` | `10 × (-0.5) = -5` | **0** ✅ | 一致 |
-| **rq = 1** | `1 ≠ 0` 为真 → `10 × 1 = +10` | `10 × (-1) = -10` | **0** ✅ | 一致 |
-| **rq > 1** (如 12) | `10 × 12 = +120` | `10 × (-12) = -120` | **0** ✅ | 一致 |
-
-#### 5.5.3 用户问题的精确答案
-
-**问题一：删除收货单时，库存是否必然反向扣回？**
-
-**答案：不必然。**
-
-只有当 `receiving_quantity ≠ 0` 时，库存才会对称反向扣回。当 `receiving_quantity = 0` 时，删除操作**完全不扣回**，导致库存永久虚增。
-
-具体场景：
-- 商品未设置包装规格（`items.receiving_quantity = 0`）
-- 收货 10 个，保存时库存 +10（兜底用了 quantity）
-- 删除该收货单，库存变动 = `10 × (-0) = 0`
-- 结果：这 10 个库存**永久留在库存中无法消除**
-
-**问题二：为什么收货倍数在 0 到 1 之间时前后处理会有差异？**
-
-**答案：严格来说，差异仅发生在 rq=0 的边界点，而非 0 < rq < 1 区间。**
-
-- **0 < rq < 1 区间**：因为 `rq != 0` 判断为真，保存时走乘法分支，与删除时对称，**行为一致**。
-  - 例：rq=0.5, qty=10 → 保存时 +5，删除时 -5 ✅
-
-- **rq = 0 的边界点**：保存时走兜底分支用 qty，删除时直接乘 0，**行为严重不一致**。
-  - 例：rq=0, qty=10 → 保存时 +10（兜底），删除时 -0=0 ❌
-
-> **执行路径清晰化**：
-> 保存时的三元运算符 `rq != 0 ? qty×rq : qty` 在 rq=0 时执行路径发生"跳变"，而删除时始终走乘法，这就是前后差异的来源。
-
-#### 5.5.4 数据保存的完整路径追溯
-
-```
-保存时数据流：
-  add_item() [Receiving_lib]
-    └─ 若 receivingQuantity = null → 取商品默认值（可能为 0）
-    └─ 存入 Session recv_cart
-         └─ save_value() [Receiving]
-              └─ rq != 0 ? qty*rq : qty   ← 此处兜底生效
-                   └─ 写入 item_quantities (+qty 或 +qty*rq)
-                   └─ 写入 inventory 表 (+qty 或 +qty*rq)
-              └─ receivings_items 表中 rq 原样保存为 0
-
-删除时数据流：
-  delete_value() [Receiving]
-    └─ get_receiving_items() → 读出 rq = 0
-         └─ change_quantity(qty × (-0) = 0)  ← 无兜底，扣回 0
-         └─ inventory 表写入 0
-```
-
-**根本原因**：保存时的三元判断逻辑**只做了单向兜底**（rq=0 时兜底），删除时没有对应的反向兜底逻辑。
-
----
 
 ## 六、供应商关联逻辑
 
@@ -858,16 +779,37 @@ delete_value(receiving_id, employee_id, update_inventory) [Receiving.php]
 
 ## 十一、已知问题与注意事项
 
-1. **🔴 receiving_quantity 单向兜底缺陷**：保存时 `rq=0` 会兜底用 quantity，但删除时无对应兜底，导致库存**无法扣回**，永久虚增。
+### 11.1 删除回滚相关问题
 
-2. **成本价格回滚缺陷**：取消收货时，成本价格不会自动回滚。如果收货时更新了成本价格，删除后成本仍保持新的平均价格。
+#### 🔴 receiving_quantity 单向兜底缺陷（第二层问题）
+保存时 `rq=0` 会走三元兜底分支用 `quantity`，但删除时无对应兜底（直接乘 0 = 0），导致库存**完全不扣回**，永久虚增。
 
-3. **无应付账款管理**：系统没有应付账款模块，收货不会自动生成对供应商的欠款记录。
+- **触发条件**：商品未设置包装规格（`receiving_quantity = 0`）
+- **影响**：收货 +N，删除 -0，净增长 +N
+- **位置**：保存 [Receiving.php#L154](file:///d:/fz/0601-1/solo-dogfeeding/code/13-opensourcepos/app/Models/Receiving.php#L154) vs 删除 [Receiving.php#L238-L244](file:///d:/fz/0601-1/solo-dogfeeding/code/13-opensourcepos/app/Models/Receiving.php#L238-L244)
 
-4. **成本计算范围**：移动平均成本计算使用**所有仓库的总库存**，而非仅收货仓库的库存。
+#### 🟡 成本价格未回滚（独立问题）
+取消收货时，成本价格不会自动回滚。如果收货时更新了平均成本，删除后成本仍保持新的平均价格。
 
-5. **成本-库存调用时序**：必须严格先算成本价（查旧库存快照），再改库存。若顺序颠倒，会导致库存虚增且成本偏低的**双重错误**。
+- **位置**：[Receiving.php#L218-L260](file:///d:/fz/0601-1/solo-dogfeeding/code/13-opensourcepos/app/Models/Receiving.php#L218-L260)（`delete_value()` 中未调用 `change_cost_price()`）
+- 代码中 TODO 注释也标记了此缺陷
 
-6. **事务完整性**：所有数据库操作都在事务中执行，保证数据一致性。
+### 11.2 保存流程相关问题
 
-7. **库存历史追踪**：所有库存变动都留有完整历史记录，可通过 `trans_comment` 字段追溯来源单据。
+#### 🟡 成本-库存调用时序依赖
+必须严格先算成本价（查旧库存快照），再改库存。若顺序颠倒，会导致**库存虚增且成本偏低的双重错误**。
+
+- 代码注释显式警告：`caution: must be used before item_quantities gets updated`
+- **设计本质**：`change_cost_price()` 依赖的是"收货前"的数据库快照，属于**隐式副作用依赖**
+
+### 11.3 架构与设计注意事项
+
+1. **无应付账款管理**：系统没有应付账款模块，收货不会自动生成对供应商的欠款记录，仅关联 `supplier_id`。
+
+2. **成本计算范围**：移动平均成本计算使用**所有仓库的总库存**，而非仅收货仓库的库存。
+
+3. **事务完整性**：所有数据库操作都在事务中执行，保证数据一致性。
+
+4. **库存历史追踪**：所有库存变动都留有完整历史记录，可通过 `trans_comment` 字段追溯来源单据（如 "RECV 123"、"Deleting receiving 123"）。
+
+5. **update_inventory 开关用途**：删除入口的 `update_inventory` 参数是总闸门，可控制是否同步回滚库存。默认开启，如需仅删除单据不碰库存可设为 `false`。
