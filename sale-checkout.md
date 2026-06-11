@@ -451,6 +451,233 @@ public function get_tax_for_amount(string $tax_basis, string $tax_percentage, in
 - 排除现金调整金额
 - 同时判断是否仅含现金类支付，以决定是否启用现金模式 (cash_mode)
 
+### 6.6 多支付状态切换与付款清空触发时机（深度分析 · 代码事实版）
+
+付款记录存储在 Session 的 `sales_payments` 键中，通过 `empty_payments()` 方法一次性清空。以下是所有触发路径的代码级分析。
+
+#### 触发时机总览（完整代码路径）
+
+| 场景 | 触发方法 | 实际调用 | 清空范围 | 设计原因 |
+|------|----------|----------|----------|----------|
+| 切换销售模式/仓库 | [Sales::postChangeMode()](file:///d:/fz/0601-1/solo-dogfeeding/code/11-opensourcepos/app/Controllers/Sales.php#L293) | `sale_lib->empty_payments()` | **全部付款** | 模式/位置切换可能改变税率、折扣、支付方式可用性 |
+| 编辑购物车商品 | [Sales::postEditItem()](file:///d:/fz/0601-1/solo-dogfeeding/code/11-opensourcepos/app/Controllers/Sales.php#L638) | `sale_lib->empty_payments()` | **全部付款** | 商品价格/数量/折扣变化会改变应付总额，已录入的支付可能不匹配 |
+| 删除购物车商品 | [Sales::getDeleteItem()](file:///d:/fz/0601-1/solo-dogfeeding/code/11-opensourcepos/app/Controllers/Sales.php#L661) | `sale_lib->empty_payments()` | **全部付款** | 应付总额减少，可能出现多付 |
+| 移除客户 | [Sales::getRemoveCustomer()](file:///d:/fz/0601-1/solo-dogfeeding/code/11-opensourcepos/app/Controllers/Sales.php#L676) | `sale_lib->delete_payment('Rewards')` | **仅积分支付** | 积分与客户绑定，移除客户需清除积分支付 |
+| 完成结账清场 | [Sale_lib::clear_all()](file:///d:/fz/0601-1/solo-dogfeeding/code/11-opensourcepos/app/Libraries/Sale_lib.php#L1426) | `empty_payments()` 内含 | **全部付款** | 整单结清，清空所有会话状态 |
+| 加载历史销售 | [Sales::_load_sale_data()](file:///d:/fz/0601-1/solo-dogfeeding/code/11-opensourcepos/app/Controllers/Sales.php#L1084) | `clear_all()` 内含 | **全部付款** | 重新开始新一笔交易 |
+| 单据输出完成后 | [Sales::postComplete()](file:///d:/fz/0601-1/solo-dogfeeding/code/11-opensourcepos/app/Controllers/Sales.php#L827/L861/L888/L919/L971) | `clear_all()` 内含 | **全部付款** | 收据/发票/邮件发送完成 |
+| 每次页面刷新 | [Sales::_reload()](file:///d:/fz/0601-1/solo-dogfeeding/code/11-opensourcepos/app/Controllers/Sales.php#L1196) | `reset_cash_rounding()` | **现金模式标志** | 每次刷新重置 cash_mode，再根据付款类型重新判断 |
+
+**明确不会清空付款的操作**：
+- `postAdd`（添加商品）
+- `postSelectCustomer`（选择/切换客户）
+- `postSetComment`（设置备注）
+- `postSetInvoiceNumber`（设置发票号）
+- `getDeletePayment`（删除单笔支付，只删指定那笔）
+
+#### 各场景代码级详细说明
+
+**场景1：切换销售模式或仓库位置 — 全额清空**
+
+```php
+public function postChangeMode(): ResponseInterface|string
+{
+    $mode = $this->request->getPost('mode', FILTER_SANITIZE_FULL_SPECIAL_CHARS);
+    $this->sale_lib->set_mode($mode);
+
+    // ... 设置 sale_type、餐桌 ...
+
+    $stock_location = $this->request->getPost('stock_location', FILTER_SANITIZE_NUMBER_INT);
+    if ($this->stock_location->is_allowed_location($stock_location, 'sales')) {
+        $this->sale_lib->set_sale_location($stock_location);
+    }
+
+    $this->sale_lib->empty_payments();   // ← 无条件清空所有付款
+    return $this->_reload();
+}
+```
+
+清空原因：
+- 切换到退货模式后，数量变负，税费计算方向改变
+- 切换到报价单/工单后，积分、礼品卡等支付方式不可用
+- 切换仓库后，商品单价和库存可能不同
+
+**场景2：编辑购物车中的商品 — 全额清空**
+
+```php
+public function postEditItem(): ResponseInterface|string
+{
+    // ... 验证 quantity / price / discount ...
+    $this->sale_lib->edit_item($line, $description, $serialnumber, $quantity, $discount, $discount_type, $price, $discounted_total);
+
+    $this->sale_lib->empty_payments();   // ← 编辑后无条件清空所有付款
+    return $this->_reload($data);
+}
+```
+
+清空原因：任何参数变化都会改变应付总额，已录入的支付可能不再匹配。
+
+**场景3：删除购物车商品 — 全额清空**
+
+```php
+public function getDeleteItem(int $item_id): ResponseInterface|string
+{
+    $this->sale_lib->delete_item($item_id);
+    $this->sale_lib->empty_payments();   // ← 删除后无条件清空所有付款
+    return $this->_reload();
+}
+```
+
+清空原因：删除商品直接减少应付总额，可能出现多付。
+
+**场景4：移除客户 — 仅清积分支付，其余付款保留**
+
+这是最容易混淆的场景。看代码：
+
+```php
+public function getRemoveCustomer(): ResponseInterface|string
+{
+    $this->sale_lib->clear_giftcard_remainder();
+    $this->sale_lib->clear_rewards_remainder();
+    $this->sale_lib->delete_payment(lang('Sales.rewards'));   // ← 只删积分支付！
+    $this->sale_lib->clear_invoice_number();
+    $this->sale_lib->clear_quote_number();
+    $this->sale_lib->remove_customer();                       // ← 只清 session 中的 customer_id
+
+    return $this->_reload();
+}
+```
+
+**关键点（与代码事实对齐）**：
+- 调用 `delete_payment('Rewards')` — 只删除积分这一种支付方式的记录
+- 不调用 `empty_payments()` — 现金、刷卡、礼品卡等其他支付**全部保留**
+- `remove_customer()` 仅删除 Session 的 `sales_customer` 键，不碰付款数组
+- 礼品卡只清「待支付余额」(`giftcard_remainder`)，已录入的礼品卡支付**不会被删除**
+
+**设计原因**：积分是客户专属的，换客户后原客户的积分不能用；但现金、刷卡等支付方式与客户无关，可以保留。
+
+**场景5：选择/切换客户 — 付款完全保留**
+
+```php
+public function postSelectCustomer(): ResponseInterface|string
+{
+    $customer_id = (int)$this->request->getPost('customer', FILTER_SANITIZE_NUMBER_INT);
+    if ($this->customer->exists($customer_id)) {
+        $this->sale_lib->set_customer($customer_id);
+        $discount = $this->customer->get_info($customer_id)->discount;
+        $discount_type = $this->customer->get_info($customer_id)->discount_type;
+
+        if ($discount != '') {
+            $this->sale_lib->apply_customer_discount($discount, $discount_type);
+        }
+    }
+    // 注意：全程没有任何清空付款的操作！
+    return $this->_reload();
+}
+```
+
+**为什么不清空？**
+- `apply_customer_discount()` 只覆盖 `discount == 0` 的商品，不会减少已有折扣
+- 应付可能减少，但实际业务中选客户是常规操作，强制重输付款体验差
+- **风险兜底**：如果应付减少导致多付，在 `postComplete` 时会通过 `cash_refund`（找零）处理
+
+**场景6：每次页面刷新 — 重置现金模式标志**
+
+这是一个隐式的状态切换：
+
+```php
+private function _reload(array $data = []): ResponseInterface|string
+{
+    $cash_rounding = $this->sale_lib->reset_cash_rounding();
+    // ...
+}
+```
+
+在 [`reset_cash_rounding()`](file:///d:/fz/0601-1/solo-dogfeeding/code/11-opensourcepos/app/Libraries/Sale_lib.php#L1446-L1459) 中：
+```php
+public function reset_cash_rounding(): int
+{
+    // ... 检查是否启用现金四舍五入 ...
+    $this->session->set('cash_rounding', $cash_rounding);
+    $this->session->set('cash_mode', CASH_MODE_FALSE);   // ← 每次刷新强制置为 false
+
+    return $cash_rounding;
+}
+```
+
+然后在 [`get_payments_total()`](file:///d:/fz/0601-1/solo-dogfeeding/code/11-opensourcepos/app/Libraries/Sale_lib.php#L669-L688) 中重新判断：
+```php
+public function get_payments_total(): string
+{
+    $cash_mode_eligible = CASH_MODE_TRUE;
+    foreach ($this->get_payments() as $payments) {
+        if (lang('Sales.cash') != $payments['payment_type']
+            && lang('Sales.cash_adjustment') != $payments['payment_type']) {
+            $cash_mode_eligible = CASH_MODE_FALSE;   // 有非现金支付 → 不进入现金模式
+        }
+    }
+    if ($cash_mode_eligible && $this->session->get('cash_rounding')) {
+        $this->session->set('cash_mode', CASH_MODE_TRUE);   // 重新置为 true
+    }
+    // ...
+}
+```
+
+**状态切换逻辑**：每次刷新页面时，`cash_mode` 先被重置为 `false`，再根据当前付款数组中是否只有现金类支付来重新判断是否进入现金模式。
+
+#### 付款部分修改的场景
+
+**删除单笔支付**：
+
+```php
+public function getDeletePayment(string $payment_id): ResponseInterface|string
+{
+    $this->sale_lib->delete_payment(base64url_decode($payment_id));
+    return $this->_reload();
+}
+```
+
+在 [`delete_payment()`](file:///d:/fz/0601-1/solo-dogfeeding/code/11-opensourcepos/app/Libraries/Sale_lib.php#L636-L655) 中：
+```php
+public function delete_payment(string $payment_id): void
+{
+    $payments = $this->get_payments();
+    $decoded_payment_id = urldecode($payment_id);
+
+    unset($payments[$decoded_payment_id]);   // 只删指定的那笔
+
+    // 现金与现金调整绑定删除
+    $cash_rounding = $this->reset_cash_rounding();
+    if ($cash_rounding) {
+        if ($decoded_payment_id == lang('Sales.cash')) {
+            unset($payments[lang('Sales.cash_adjustment')]);
+        }
+        if ($decoded_payment_id == lang('Sales.cash_adjustment')) {
+            unset($payments[lang('Sales.cash')]);
+        }
+    }
+    $this->set_payments($payments);
+}
+```
+
+**添加新支付时的现金模式切换**：
+
+在 [`add_payment()`](file:///d:/fz/0601-1/solo-dogfeeding/code/11-opensourcepos/app/Libraries/Sale_lib.php#L605-L609) 中：
+```php
+if ($this->session->get('cash_mode')) {
+    // 已在现金模式，但新添加非现金支付 → 退出现金模式
+    if ($this->session->get('cash_rounding')
+        && $payment_id != lang('Sales.cash')
+        && $payment_id != lang('Sales.cash_adjustment')) {
+        $this->session->set('cash_mode', CASH_MODE_FALSE);
+        // 注意：已有的现金调整记录不会被删除！
+        // 但后续计算将从 cash_amount_due 切回 amount_due
+    }
+}
+```
+
+**关键发现**：退出现金模式时**不会删除**已录入的现金调整记录，这可能导致结账时出现异常找零。
+
 ---
 
 ## 七、总额计算
@@ -673,6 +900,153 @@ return $this->db->transStatus() ? $sale_id : -1;
 1. 清空购物车和支付：`$this->sale_lib->clear_all()`
 2. 生成收据条形码
 3. 返回对应视图：收据/发票/报价单/工单
+
+### 8.9 现金找零与现金调整对落库的影响（深度分析）
+
+现金支付涉及两个特殊字段：`cash_refund`（找零）和 `cash_adjustment`（现金调整）。它们影响支付记录落库、实际收款核算和客户积分计算。
+
+#### 概念区分
+
+| 字段 | 含义 | 产生时机 | 正负方向 |
+|------|------|----------|----------|
+| `cash_refund` | 现金找零，即实收现金与应付的差额 | `postComplete` 结账时 | 正值 = 退还给客户的金额 |
+| `cash_adjustment` | 现金四舍五入调整，平衡精确应付与实际收取的现金面额差异 | `postAddPayment` 添加现金支付时 | 可正可负（正 = 多收，负 = 抹零） |
+
+#### 现金调整的产生过程
+
+**位置**：[Sales::postAddPayment()](file:///d:/fz/0601-1/solo-dogfeeding/code/11-opensourcepos/app/Controllers/Sales.php#L462-L471)
+
+```php
+elseif ($payment_type === lang('Sales.cash')) {
+    $amount_due = $this->sale_lib->get_total();       // 现金模式下的四舍五入后应付
+    $sales_total = $this->sale_lib->get_total(false); // 精确计算的应付（未四舍五入）
+    $amount_tendered = parse_decimals($this->request->getPost('amount_tendered'));
+
+    $this->sale_lib->add_payment($payment_type, $amount_tendered);
+
+    $cash_adjustment_amount = $amount_due - $sales_total;
+    if ($cash_adjustment_amount <> 0) {
+        $this->session->set('cash_mode', CASH_MODE_TRUE);
+        $this->sale_lib->add_payment(
+            lang('Sales.cash_adjustment'),
+            $cash_adjustment_amount,
+            CASH_ADJUSTMENT_TRUE    // 标记为调整记录
+        );
+    }
+}
+```
+
+**计算逻辑**：
+- `get_total()` 不带参数 → 内部用 `cash_mode` 判断是否调用 `check_for_cash_rounding()` 进行四舍五入
+- `get_total(false)` → 强制不四舍五入，返回精确计算值
+- 调整金额 = 四舍五入后应付 - 精确应付
+- 调整金额不为 0 时，额外插入一条「现金调整」支付记录
+
+**示例**：
+- 精确应付 = 12.345 元
+- 现金四舍五入后 = 12.35 元（cash_decimals = 2，HALF_UP）
+- 调整金额 = 12.35 - 12.345 = 0.005 元 → 系统多收 0.5 分
+
+#### 现金找零的产生过程
+
+**位置**：[Sales::postComplete()](file:///d:/fz/0601-1/solo-dogfeeding/code/11-opensourcepos/app/Controllers/Sales.php#L763-L787)
+
+```php
+if ($data['cash_mode']) {
+    $data['amount_due'] = $totals['cash_amount_due'];    // 用四舍五入后的应付
+} else {
+    $data['amount_due'] = $totals['amount_due'];          // 用精确应付
+}
+
+$data['amount_change'] = $data['amount_due'] * -1;    // amount_due 为负表示多付
+
+if ($data['amount_change'] > 0) {
+    // 找零 > 0 表示客户多付了，需要找回
+    if (array_key_exists(lang('Sales.cash'), $data['payments'])) {
+        // 已有现金支付记录 → 写到该记录的 cash_refund 字段
+        $data['payments'][lang('Sales.cash')]['cash_refund'] = $data['amount_change'];
+    } else {
+        // 没有现金支付记录 → 创建一条金额为 0 的现金记录，专门记录找零
+        $payment = [
+            lang('Sales.cash') => [
+                'payment_type'   => lang('Sales.cash'),
+                'payment_amount' => 0,
+                'cash_refund'    => $data['amount_change']
+            ]
+        ];
+        $data['payments'] += $payment;
+    }
+}
+```
+
+**关键设计**：找零不单独创建支付记录，而是**挂在现金支付记录上**。如果没有现金支付（比如全是刷卡支付但因某种原因需要找零），则创建一条 `payment_amount = 0` 的虚拟现金记录来承载找零。
+
+#### 落库时的影响
+
+**位置**：[Sale::save_value()](file:///d:/fz/0601-1/solo-dogfeeding/code/11-opensourcepos/app/Models/Sale.php#L579-L606)
+
+```php
+$total_amount = 0;         // 实际净收款金额（用于计算客户积分）
+$total_amount_used = 0;    // 积分支付金额
+
+foreach ($payments as $payment_id => $payment) {
+    // 处理礼品卡：扣减礼品卡余额
+    // 处理积分支付：扣减客户积分，累加到 total_amount_used
+
+    $sales_payments_data = [
+        'sale_id'         => $sale_id,
+        'payment_type'    => $payment['payment_type'],
+        'payment_amount'  => $payment['payment_amount'],
+        'cash_refund'     => $payment['cash_refund'],       // 原样写入
+        'cash_adjustment' => $payment['cash_adjustment'],   // 原样写入
+        'employee_id'     => $employee_id
+    ];
+
+    $builder = $this->db->table('sales_payments');
+    $builder->insert($sales_payments_data);
+
+    // 净收款 = payment_amount - cash_refund
+    $total_amount = floatval($total_amount)
+        + floatval($payment['payment_amount'])
+        - floatval($payment['cash_refund']);
+}
+
+// 用净收款（扣除找零后的实收）计算客户积分
+$this->save_customer_rewards($customer_id, $sale_id, $total_amount, $total_amount_used);
+```
+
+**落库影响总结**：
+
+| 维度 | cash_refund 影响 | cash_adjustment 影响 |
+|------|------------------|----------------------|
+| `sales_payments` 表 | 作为字段直接写入 | 作为字段直接写入 |
+| 实际收款核算 | `净收款 = payment_amount - cash_refund` | 自身的 `payment_amount` 就是调整值，`cash_adjustment = 1` 标记其性质 |
+| 客户积分计算 | 积分基于净收款（扣掉找零后）计算 | 调整记录会被算作一笔独立支付，但其 `payment_amount` 已纳入积分计算基数 |
+| 报表统计 | 找零金额需要单独统计，不能算作收入 | 调整记录需要通过 `cash_adjustment = 1` 过滤出来单独核算 |
+
+#### 特殊边界场景
+
+**场景1：非现金支付产生找零**
+
+当选择客户后应用折扣导致应付减少，而此前已用信用卡全额支付时：
+- `amount_change > 0`（多付）
+- 没有 `Cash` 支付记录 → 创建 `payment_amount = 0, cash_refund = 找零额` 的虚拟现金记录
+- 落库后，报表需注意这条记录的现金支付为 0，只是找零记录
+
+**场景2：现金调整方向为负（抹零）**
+
+当 `cash_rounding_code` 配置为向下取整或舍入后金额变小时：
+- `cash_adjustment_amount = 负值`
+- 相当于系统给客户抹零让利
+- 现金调整记录的 `payment_amount` 为负，减少整体支付总额
+
+**场景3：现金模式下加入非现金支付**
+
+先用现金支付（产生了现金调整），然后又加了一笔信用卡支付：
+- `add_payment()` 检测到非现金支付 → `cash_mode` 置为 `FALSE`
+- 已有的现金调整记录**不会被删除**
+- 但 `amount_due` 计算切换为精确值（不再四舍五入）
+- 结账时可能导致 `amount_change` 与之前预期的不同，产生异常找零
 
 ---
 
