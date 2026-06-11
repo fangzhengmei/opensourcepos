@@ -1,28 +1,62 @@
 # 商品数量调整与库存流水一致性分析
 
-## 1. 核心数据结构
+## 1. 核心概念与数据结构
 
 ### 1.1 商品资料 (items 表)
 
 **模型文件**: [Item.php](file:///d:/fz/0601-1/solo-dogfeeding/code/12-opensourcepos/app/Models/Item.php)
 
+#### 1.1.1 核心字段说明
+
 | 字段 | 类型 | 说明 | 常量定义 |
 |------|------|------|----------|
-| `stock_type` | int | 库存类型 | `HAS_STOCK` = 0 (有库存), `HAS_NO_STOCK` = 1 (无库存) |
-| `item_type` | int | 商品类型 | `ITEM` = 0, `ITEM_KIT` = 1, `ITEM_AMOUNT_ENTRY` = 2, `ITEM_TEMP` = 3 |
+| `stock_type` | int | **库存管控开关**：决定该商品是否参与所有库存变动操作 | `HAS_STOCK` = 0 (有库存), `HAS_NO_STOCK` = 1 (无库存) |
+| `item_type` | int | **商品业务类型**：决定商品的业务行为 | `ITEM` = 0, `ITEM_KIT` = 1, `ITEM_AMOUNT_ENTRY` = 2, `ITEM_TEMP` = 3 |
+| `receiving_quantity` | decimal | **默认收货换算倍率**：收货时每单位采购对应的实际入库数量 | - |
 | `reorder_level` | decimal | 库存预警水平 | - |
-| `receiving_quantity` | decimal | 默认收货数量 | - |
-| `qty_per_pack` | decimal | 每包数量 | - |
+| `qty_per_pack` | decimal | 每包数量（销售包装） | - |
 
-**关键常量定义** ([Constants.php](file:///d:/fz/0601-1/solo-dogfeeding/code/12-opensourcepos/app/Config/Constants.php#L107-L114)):
+#### 1.1.2 关键常量定义
+
+**位置**: [Constants.php](file:///d:/fz/0601-1/solo-dogfeeding/code/12-opensourcepos/app/Config/Constants.php#L107-L114)
 
 ```php
-const HAS_STOCK = 0;      // 有库存商品
-const HAS_NO_STOCK = 1;   // 无库存商品（服务类等）
+const HAS_STOCK = 0;      // 参与库存管理
+const HAS_NO_STOCK = 1;   // 不参与库存管理（服务、劳务等）
 const ITEM = 0;           // 普通商品
-const ITEM_KIT = 1;       // 商品套装
-const ITEM_AMOUNT_ENTRY = 2;  // 金额输入商品
-const ITEM_TEMP = 3;      // 临时商品
+const ITEM_KIT = 1;       // 商品套装（组合品）
+const ITEM_AMOUNT_ENTRY = 2;  // 金额输入商品（无固定数量）
+const ITEM_TEMP = 3;      // 临时商品（一次性格销售商品）
+```
+
+#### 1.1.3 stock_type 与 item_type 的真实约束关系
+
+**核心代码**: [Items.php::postSave()](file:///d:/fz/0601-1/solo-dogfeeding/code/12-opensourcepos/app/Controllers/Items.php#L661-L665)
+
+```php
+if ($item_data['item_type'] == ITEM_TEMP) {
+    $item_data['stock_type'] = HAS_NO_STOCK;      // 强制无库存
+    $item_data['receiving_quantity'] = 0;          // 强制收货倍率为0
+    $item_data['reorder_level'] = 0;               // 强制无预警
+}
+```
+
+**强制约束关系表**：
+
+| item_type | stock_type 可选项 | receiving_quantity 约束 | 说明 |
+|-----------|-----------------|------------------------|------|
+| `ITEM` (0) | `HAS_STOCK` 或 `HAS_NO_STOCK` | 用户输入，若为0则强制设为1 | 普通商品，可灵活配置 |
+| `ITEM_KIT` (1) | `HAS_STOCK` 或 `HAS_NO_STOCK` | 用户输入，若为0则强制设为1 | 套装本身一般 HAS_NO_STOCK，通过子商品扣库存 |
+| `ITEM_AMOUNT_ENTRY` (2) | `HAS_STOCK` 或 `HAS_NO_STOCK` | 用户输入，若为0则强制设为1 | 金额商品一般 HAS_NO_STOCK |
+| `ITEM_TEMP` (3) | **强制 HAS_NO_STOCK**（代码覆盖） | **强制设为 0** | 临时商品永远不参与库存管理 |
+
+**receiving_quantity 的自动修正**:
+**代码**: [Items.php::postSave()](file:///d:/fz/0601-1/solo-dogfeeding/code/12-opensourcepos/app/Controllers/Items.php#L628-L630)
+
+```php
+if ($receiving_quantity === 0.0 && $item_type !== ITEM_TEMP) {
+    $receiving_quantity = 1;   // 只要不是临时商品，就不允许 receiving_quantity=0
+}
 ```
 
 ### 1.2 库存数量 (item_quantities 表)
@@ -31,21 +65,13 @@ const ITEM_TEMP = 3;      // 临时商品
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `item_id` | int | 商品ID (主键) |
-| `location_id` | int | 仓库位置ID (主键) |
+| `item_id` | int | 商品ID (联合主键) |
+| `location_id` | int | 仓库位置ID (联合主键) |
 | `quantity` | decimal | 当前库存数量 |
 
-**核心方法** ([Item_quantity.php#L91-L98](file:///d:/fz/0601-1/solo-dogfeeding/code/12-opensourcepos/app/Models/Item_quantity.php#L91-L98)):
-
-```php
-public function change_quantity(int $item_id, int $location_id, int $quantity_change): bool
-{
-    $quantity_old = $this->get_item_quantity($item_id, $location_id);
-    $quantity_new = $quantity_old->quantity + $quantity_change;
-    $location_detail = ['item_id' => $item_id, 'location_id' => $location_id, 'quantity' => $quantity_new];
-    return $this->save_value($location_detail, $item_id, $location_id);
-}
-```
+**核心方法**:
+- `save_value()`: 直接设置绝对数量（用于新建、手动调整、CSV导入）
+- `change_quantity()`: 增量更新（用于删除回滚操作）
 
 ### 1.3 库存流水 (inventory 表)
 
@@ -61,213 +87,410 @@ public function change_quantity(int $item_id, int $location_id, int $quantity_ch
 | `trans_inventory` | decimal | 库存变化量 (正=入库, 负=出库) |
 | `trans_location` | int | 仓库位置ID |
 
-## 2. 库存增减的代码路径
+---
 
-系统中有 **5个主要入口** 会触发库存变化，所有入口都会同时更新 `item_quantities`（库存数量）和 `inventory`（库存流水）。
+## 2. receiving_quantity 对库存流水的影响机制
 
-### 2.1 商品保存时调整库存 (手动调整)
+### 2.1 receiving_quantity 的本质
+
+`receiving_quantity` 是 **「采购包装单位 → 库存基本单位」的换算倍率**，仅在收货场景生效。
+
+**例**: 商品A采购时按「箱」进货，每箱有24瓶。设置 `receiving_quantity = 24`。收货时录入采购数量=5箱，则实际入库 5×24=120 瓶。
+
+### 2.2 收货时的计算流程
+
+**代码位置**: [Receiving.php::save_value()](file:///d:/fz/0601-1/solo-dogfeeding/code/12-opensourcepos/app/Models/Receiving.php#L154-L183)
+
+```php
+// 步骤1：计算实际入库数量
+$items_received = $item_data['receiving_quantity'] != 0
+    ? $item_data['quantity'] * $item_data['receiving_quantity']    // 使用换算倍率
+    : $item_data['quantity'];                                      // 倍率为0时直接使用数量
+
+// 步骤2：更新 item_quantities（加 items_received）
+$item_quantity->save_value([
+    'quantity' => $item_quantity_value->quantity + $items_received,
+    // ...
+]);
+
+// 步骤3：插入 inventory 流水（trans_inventory = items_received）
+$inv_data = [
+    'trans_comment'   => 'RECV ' . $receiving_id,
+    'trans_inventory' => $items_received    // 注意：不是 quantity，是 items_received
+];
+$inventory->insert($inv_data, false);
+```
+
+### 2.3 删除收货时的回滚计算
+
+**代码位置**: [Receiving.php::delete_value()](file:///d:/fz/0601-1/solo-dogfeeding/code/12-opensourcepos/app/Models/Receiving.php#L238-L244)
+
+```php
+// 回滚时同样使用换算倍率
+$inv_data = [
+    'trans_comment'   => 'Deleting receiving ' . $receiving_id,
+    'trans_inventory' => $item['quantity_purchased'] * (-$item['receiving_quantity'])
+];
+$inventory->insert($inv_data, false);
+
+$item_quantity->change_quantity(
+    $item['item_id'],
+    $item['item_location'],
+    $item['quantity_purchased'] * (-$item['receiving_quantity'])  // 负号表示减少
+);
+```
+
+### 2.4 金额计算中的使用
+
+**代码位置**: [Receiving_lib.php::get_item_total()](file:///d:/fz/0601-1/solo-dogfeeding/code/12-opensourcepos/app/Libraries/Receiving_lib.php#L485-L497)
+
+```php
+public function get_item_total(float $quantity, float $price, float $discount, ?int $discount_type, float $receiving_quantity): string
+{
+    $extended_quantity = bcmul($quantity, $receiving_quantity);  // 实际数量 = 采购数 × 倍率
+    $total = bcmul($extended_quantity, $price);                   // 总金额 = 实际数量 × 单价
+    // ... 折扣处理
+}
+```
+
+### 2.5 receiving_quantity 对销售的影响 —— **无影响**
+
+**关键发现**: 销售出库时 **完全不使用** `receiving_quantity`。
+
+**代码位置**: [Sale.php::save_value()](file:///d:/fz/0601-1/solo-dogfeeding/code/12-opensourcepos/app/Models/Sale.php#L635-L662)
+
+```php
+if ($cur_item_info->stock_type == HAS_STOCK && $sale_status == COMPLETED) {
+    // 扣减库存：直接使用 quantity，不经过任何倍率换算
+    $item_quantity->save_value([
+        'quantity' => $item_quantity_data->quantity - $item_data['quantity'],  // 无换算
+        // ...
+    ]);
+    
+    // 流水记录：直接使用 -quantity
+    $inv_data = [
+        'trans_inventory' => -$item_data['quantity']  // 无换算
+    ];
+}
+```
+
+**结论**: `receiving_quantity` **仅作用于收货模块**，销售模块不使用该字段。销售时的包装换算使用 `qty_per_pack`（销售包装）。
+
+---
+
+## 3. 六大库存操作的完整代码路径与一致性分析
+
+### 3.1 操作总览：各场景的检查与执行对比
+
+| 场景 | 检查 stock_type | 检查 item_type | receiving_quantity 参与 | 事务保护 |
+|------|----------------|----------------|------------------------|----------|
+| **商品保存 postSave()** | ❌ 不检查 | ✅ 仅 ITEM_TEMP 强制清库存 | ❌ | ❌ 无 |
+| **库存调整 postSaveInventory()** | ❌ 完全不检查 | ❌ 完全不检查 | ❌ | ❌ 无 |
+| **销售出库 Sale::save_value()** | ✅ `HAS_STOCK` 才扣减 | ❌ 不检查 | ❌ | ✅ 有 |
+| **收货入库 Receiving::save_value()** | ❌ 完全不检查 | ❌ 完全不检查 | ✅ 参与计算 | ✅ 有 |
+| **CSV 导入 save_inventory_quantities()** | ❌ 完全不检查 | ❌ 完全不检查 | ❌ | ✅ 有（外部） |
+| **删除收货 Receiving::delete_value()** | ❌ 完全不检查 | ❌ 完全不检查 | ✅ 参与计算 | ✅ 有 |
+
+---
+
+### 3.2 商品保存时调整库存 (postSave)
 
 **控制器**: [Items.php::postSave()](file:///d:/fz/0601-1/solo-dogfeeding/code/12-opensourcepos/app/Controllers/Items.php#L618-L759)
 
+#### 3.2.1 ITEM_TEMP 的特殊处理
+
 ```php
-// 代码片段 (Lines 712-742)
+// Lines 716-718: 临时商品强制库存为0
+if ($item_data['item_type'] == ITEM_TEMP) {
+    $updated_quantity = 0;
+}
+```
+
+#### 3.2.2 库存更新逻辑
+
+```php
 foreach ($stock_locations as $location) {
     $updated_quantity = parse_quantity($this->request->getPost('quantity_' . $location['location_id']));
-    
+
+    if ($item_data['item_type'] == ITEM_TEMP) {
+        $updated_quantity = 0;   // ITEM_TEMP 强制清零
+    }
+
     $item_quantity = $this->item_quantity->get_item_quantity($item_id, $location['location_id']);
-    
+
     if ($item_quantity->quantity != $updated_quantity || $new_item) {
-        // 1. 更新 item_quantities 表
+        // 1. 更新 item_quantities（先）
         $success = $success && $this->item_quantity->save_value($location_detail, $item_id, $location['location_id']);
-        
-        // 2. 插入 inventory 流水记录
+
+        // 2. 插入 inventory 流水（后）—— 存差值
         $inv_data = [
-            'trans_date'      => date('Y-m-d H:i:s'),
-            'trans_items'     => $item_id,
-            'trans_user'      => $employee_id,
-            'trans_location'  => $location['location_id'],
             'trans_comment'   => lang('Items.manually_editing_of_quantity'),
-            'trans_inventory' => $updated_quantity - $item_quantity->quantity  // 差值
+            'trans_inventory' => $updated_quantity - $item_quantity->quantity
         ];
         $success = $success && $this->inventory->insert($inv_data, false);
     }
 }
 ```
 
-**特点**:
-- 先更新 `item_quantities`，后插入 `inventory`
-- `trans_inventory` 存储的是 **变化差值** (新数量 - 旧数量)
-- 两个操作在同一个循环内，无数据库事务包裹
+#### 3.2.3 问题
 
-### 2.2 专门的库存调整表单
+- **❌ 未检查 stock_type**：即使商品是 `HAS_NO_STOCK`，用户输入了库存数量照样写入 `item_quantities` 和 `inventory`
+- **❌ 无事务保护**：两个操作可能部分成功
+- **✅ 仅 ITEM_TEMP 特殊处理**：库存强制清零
+
+---
+
+### 3.3 专门的库存调整表单 (postSaveInventory)
 
 **控制器**: [Items.php::postSaveInventory()](file:///d:/fz/0601-1/solo-dogfeeding/code/12-opensourcepos/app/Controllers/Items.php#L855-L889)
 
-**视图**: [form_inventory.php](file:///d:/fz/0601-1/solo-dogfeeding/code/12-opensourcepos/app/Views/items/form_inventory.php)
-
 ```php
-// 代码片段 (Lines 861-880)
-$inv_data = [
-    'trans_date'      => date('Y-m-d H:i:s'),
-    'trans_items'     => $item_id,
-    'trans_user'      => $employee_id,
-    'trans_location'  => $location_id,
-    'trans_comment'   => $this->request->getPost('trans_comment'),
-    'trans_inventory' => parse_quantity($new_quantity)  // 直接存储输入的增减量
-];
+// ⚠️ 完全没有任何 stock_type / item_type 检查！
+$cur_item_info = $this->item->get_info($item_id);  // 获取了商品信息但未使用
 
-// 1. 先插入 inventory 流水记录
+// 1. 先插入流水
+$inv_data = [
+    'trans_inventory' => parse_quantity($new_quantity)  // 直接存输入的增减量
+];
 $this->inventory->insert($inv_data, false);
 
-// 2. 后更新 item_quantities 表
+// 2. 后更新数量
 $item_quantity_data = [
-    'item_id'     => $item_id,
-    'location_id' => $location_id,
-    'quantity'    => $item_quantity->quantity + parse_quantity($this->request->getPost('newquantity'))
+    'quantity' => $item_quantity->quantity + parse_quantity($this->request->getPost('newquantity'))
 ];
 $this->item_quantity->save_value($item_quantity_data, $item_id, $location_id);
 ```
 
-**特点**:
-- 先插入 `inventory`，后更新 `item_quantities`（与 postSave 顺序相反）
-- `trans_inventory` 直接存储用户输入的 **增减量**
-- 无数据库事务包裹
-- 操作顺序与 2.1 相反，增加了不一致风险
+#### 问题
 
-### 2.3 销售出库
+- **❌ 完全不检查 stock_type**：`HAS_NO_STOCK` / `ITEM_TEMP` 商品照样可以调整库存
+- **❌ 完全不检查 item_type**
+- **❌ 操作顺序与 postSave 相反**：先插流水后更数量
+- **❌ 无事务保护**
+- **trans_inventory 含义不同**：存的是「增量」而非「目标值-当前值」的差值（与 postSave 不同但数学等价）
+
+---
+
+### 3.4 销售出库 (Sale::save_value)
 
 **模型**: [Sale.php::save_value()](file:///d:/fz/0601-1/solo-dogfeeding/code/12-opensourcepos/app/Models/Sale.php#L518-L688)
 
 ```php
-// 代码片段 (Lines 635-666)
+// ✅ 唯一有 stock_type 检查的场景！
 if ($cur_item_info->stock_type == HAS_STOCK && $sale_status == COMPLETED) {
-    // 1. 更新 item_quantities 表
-    $item_quantity_data = $item_quantity->get_item_quantity($item_data['item_id'], $item_data['item_location']);
+    // 更新 item_quantities（先）
     $item_quantity->save_value([
         'quantity'    => $item_quantity_data->quantity - $item_data['quantity'],
-        'item_id'     => $item_data['item_id'],
-        'location_id' => $item_data['item_location']
-    ], $item_data['item_id'], $item_data['item_location']);
-    
-    // 2. 插入 inventory 流水记录
+        // ...
+    ]);
+
+    // 插入 inventory 流水（后）
     $inv_data = [
-        'trans_date'      => date('Y-m-d H:i:s'),
-        'trans_items'     => $item_data['item_id'],
-        'trans_user'      => $employee_id,
-        'trans_location'  => $item_data['item_location'],
         'trans_comment'   => 'POS ' . $sale_id,
-        'trans_inventory' => -$item_data['quantity']  // 负数表示出库
+        'trans_inventory' => -$item_data['quantity']
     ];
     $inventory->insert($inv_data, false);
 }
 ```
 
-**特点**:
-- 先更新 `item_quantities`，后插入 `inventory`
-- 在数据库事务内执行 (`$this->db->transStart()` / `transComplete()`)
-- `trans_inventory` 为负值表示出库
-- 仅当 `stock_type == HAS_STOCK` 且 `sale_status == COMPLETED` 时才更新库存
+#### 特点
 
-### 2.4 收货入库
+- **✅ 检查 stock_type**：只有 `HAS_STOCK` 才扣库存和写流水
+- **❌ 不检查 item_type**：理论上 `ITEM_TEMP` 商品被强制 `HAS_NO_STOCK`，所以间接被挡住了
+- **✅ 事务保护**：在 `transStart` / `transComplete` 内
+- **receiving_quantity 不参与计算**：销售扣减与收货倍率无关
+
+---
+
+### 3.5 收货入库 (Receiving::save_value)
 
 **模型**: [Receiving.php::save_value()](file:///d:/fz/0601-1/solo-dogfeeding/code/12-opensourcepos/app/Models/Receiving.php#L103-L190)
 
 ```php
-// 代码片段 (Lines 161-183)
-// 1. 更新 item_quantities 表
-$item_quantity_value = $item_quantity->get_item_quantity($item_data['item_id'], $item_data['item_location']);
-$item_quantity->save_value([
-    'quantity'    => $item_quantity_value->quantity + $items_received,
-    'item_id'     => $item_data['item_id'],
-    'location_id' => $item_data['item_location']
-], $item_data['item_id'], $item_data['item_location']);
+// ❌ 完全不检查 stock_type！
+// 无论 HAS_STOCK 还是 HAS_NO_STOCK，都写入库存！
 
-// 2. 插入 inventory 流水记录
+$items_received = $item_data['receiving_quantity'] != 0
+    ? $item_data['quantity'] * $item_data['receiving_quantity']
+    : $item_data['quantity'];
+
+// 1. 更新数量（先）
+$item_quantity->save_value([
+    'quantity' => $item_quantity_value->quantity + $items_received,
+    // ...
+]);
+
+// 2. 插入流水（后）
 $inv_data = [
-    'trans_date'      => date('Y-m-d H:i:s'),
-    'trans_items'     => $item_data['item_id'],
-    'trans_user'      => $employee_id,
-    'trans_location'  => $item_data['item_location'],
     'trans_comment'   => 'RECV ' . $receiving_id,
-    'trans_inventory' => $items_received  // 正数表示入库
+    'trans_inventory' => $items_received
 ];
 $inventory->insert($inv_data, false);
 ```
 
-**特点**:
-- 先更新 `item_quantities`，后插入 `inventory`
-- 在数据库事务内执行
-- `trans_inventory` 为正值表示入库
+#### 问题
 
-### 2.5 删除销售/收货时的库存回滚
+- **❌ 完全不检查 stock_type**：`HAS_NO_STOCK` 商品（服务类、临时商品）也能入库并产生流水
+- **❌ 完全不检查 item_type**：`ITEM_TEMP` 商品被强制 `receiving_quantity=0`，所以 `items_received = quantity * 0 = 0`，实际不会改变库存数量，但仍然会 **插入一条 trans_inventory=0 的流水记录**
+- **✅ 事务保护**
+- **✅ receiving_quantity 参与计算**
 
-**删除销售**: [Sale.php::delete()](file:///d:/fz/0601-1/solo-dogfeeding/code/12-opensourcepos/app/Models/Sale.php#L795-L839)
+#### ITEM_TEMP 收货时的实际行为推演
 
-**删除收货**: [Receiving.php::delete_value()](file:///d:/fz/0601-1/solo-dogfeeding/code/12-opensourcepos/app/Models/Receiving.php#L218-L260)
+```
+ITEM_TEMP 商品：
+  stock_type = HAS_NO_STOCK  （强制）
+  receiving_quantity = 0     （强制）
+  
+收货时：
+  items_received = quantity * 0 = 0
+  item_quantities += 0   → 库存不变
+  inventory 插入一条 trans_inventory=0 的流水 ✗（产生了无意义记录）
+```
+
+---
+
+### 3.6 CSV 导入 (save_inventory_quantities)
+
+**控制器**: [Items.php::postImportCsvFile()](file:///d:/fz/0601-1/solo-dogfeeding/code/12-opensourcepos/app/Controllers/Items.php#L979-L1107)
+
+**内部方法**: [Items.php::save_inventory_quantities()](file:///d:/fz/0601-1/solo-dogfeeding/code/12-opensourcepos/app/Controllers/Items.php#L1264-L1299)
+
+#### 3.6.1 itemData 构建时的缺失
+
+**代码 Lines 1013-1024**:
 
 ```php
-// 删除销售时的库存回滚 (Sale.php Lines 814-829)
-if ($update_inventory && $sale_status == COMPLETED) {
-    foreach ($items as $item_data) {
-        if ($cur_item_info->stock_type == HAS_STOCK) {
-            // 1. 插入 inventory 流水记录（反向操作）
-            $inv_data = [
-                'trans_inventory' => $item_data['quantity_purchased'],  // 正值（加回库存）
-                'trans_comment'   => 'Deleting sale ' . $sale_id,
-                // ...
-            ];
-            $inventory->insert($inv_data, false);
+$itemData = [
+    'item_id'       => $itemId,
+    'name'          => $row['Item Name'],
+    'description'   => filter_var($row['Description'], ...),
+    'category'      => $row['Category'],
+    'cost_price'    => $row['Cost Price'],
+    'unit_price'    => $row['Unit Price'],
+    'reorder_level' => $row['Reorder Level'],
+    'deleted'       => false,
+    'hsn_code'      => $row['HSN'],
+    'pic_filename'  => $row['Image']
+];
+// ❌ 未设置 stock_type → 使用数据库默认值（通常为 0=HAS_STOCK）
+// ❌ 未设置 item_type → 使用数据库默认值（通常为 0=ITEM）
+// ❌ 未设置 receiving_quantity → 使用数据库默认值
+```
+
+**CSV 模板中 stock_type / item_type 的映射**：需要检查 CSV 模板是否包含这些字段。根据代码，这些字段不在 `$itemData` 中显式设置。
+
+#### 3.6.2 库存写入逻辑
+
+```php
+private function save_inventory_quantities(array $row, array $item_data, array $allowed_locations, int $employee_id): bool
+{
+    foreach ($allowed_locations as $location_id => $location_name) {
+        $csv_data = [
+            'trans_items'    => $item_data['item_id'],
+            'trans_user'     => $employee_id,
+            'trans_comment'  => lang('Items.inventory_CSV_import_quantity'),
+            'trans_location' => $location_id
+        ];
+
+        if (!empty($row["location_$location_name"]) || $row["location_$location_name"] === '0') {
+            // 有明确数量的情况
+            $item_quantity_data['quantity'] = $row["location_$location_name"];
+            $success &= $this->item_quantity->save_value($item_quantity_data, ...);
+
+            $csv_data['trans_inventory'] = $row["location_$location_name"];  // ⚠️ 存的是绝对值！
+            $success &= (bool)$this->inventory->insert($csv_data, false);
             
-            // 2. 更新 item_quantities 表
-            $item_quantity->change_quantity($item_data['item_id'], $item_data['item_location'], $item_data['quantity_purchased']);
+        } elseif ($is_update) {
+            // 更新已有商品：CSV 该列为空 → 跳过，不修改库存
+            continue;
+            
+        } else {
+            // 新建商品：CSV 该列为空 → 初始化为 0
+            $item_quantity_data['quantity'] = 0;
+            $success &= $this->item_quantity->save_value($item_quantity_data, ...);
+
+            $csv_data['trans_inventory'] = 0;
+            $success &= (bool)$this->inventory->insert($csv_data, false);
         }
     }
 }
 ```
 
-**特点**:
-- 先插入 `inventory`，后更新 `item_quantities`（顺序与正常操作相反）
-- 在数据库事务内执行
+#### 3.6.3 重大问题：trans_inventory 存储绝对值而非增量
 
-## 3. 库存流水的记录机制
+```
+假设商品原库存：50
+CSV 中填写：80
 
-### 3.1 流水记录的构成
+实际操作：
+  item_quantities 设置为 80  ✅（正确）
+  inventory 插入 trans_inventory = 80 ❌（应该是 80-50=30）
 
-每次库存变化都会在 `inventory` 表中产生一条记录，核心字段：
-
-| 操作类型 | trans_comment | trans_inventory |
-|----------|---------------|-----------------|
-| 手动编辑商品数量 | `Items.manually_editing_of_quantity` | 差值 (新-旧) |
-| 库存调整表单 | 用户输入的备注 | 用户输入的增减量 |
-| 销售出库 | `POS {sale_id}` | -销售数量 |
-| 收货入库 | `RECV {receiving_id}` | +收货数量 |
-| 删除销售 | `Deleting sale {sale_id}` | +销售数量 |
-| 删除收货 | `Deleting receiving {receiving_id}` | -收货数量 |
-| 删除商品 | `Items.is_deleted` | -当前库存总和 |
-
-### 3.2 库存汇总查询
-
-**模型方法**: [Inventory.php::get_inventory_sum()](file:///d:/fz/0601-1/solo-dogfeeding/code/12-opensourcepos/app/Models/Inventory.php#L91-L99)
-
-```php
-public function get_inventory_sum(int $item_id): array
-{
-    $builder = $this->db->table('inventory');
-    $builder->select('SUM(trans_inventory) AS sum, MAX(trans_location) AS location_id');
-    $builder->where('trans_items', $item_id);
-    $builder->groupBy('trans_location');
-    return $builder->get()->getResultArray();
-}
+一致性校验公式失效：
+  SUM(trans_inventory) = 80 + 之前的流水
+  item_quantities = 80
+  → 两者不相等！
 ```
 
-**理论上**，对于任一商品在任一仓库：
-```
-item_quantities.quantity = SUM(inventory.trans_inventory)
-```
+**这是 CSV 导入时库存流水与实际数量不一致的根本原因。**
 
-## 4. 负库存边界检查
+#### 3.6.4 其他问题
 
-### 4.1 库存检查逻辑
+- **❌ 完全不检查 stock_type**：任何商品都可以通过 CSV 导入库存
+- **❌ 完全不检查 item_type**
+- **❌ 新商品时 itemData 缺少 stock_type/item_type**：使用数据库默认值，可能与预期不符
+- **✅ 外层有事务保护**：`$db->transBegin()` / `transCommit()` 包裹整个 CSV 导入循环
+
+---
+
+## 4. 各操作中商品类型矩阵行为分析
+
+### 4.1 ITEM + HAS_STOCK（标准库存商品）
+
+| 操作 | item_quantities | inventory 流水 | 说明 |
+|------|----------------|---------------|------|
+| postSave 调整 | ✅ 更新 | ✅ 记录差值 | 正常 |
+| postSaveInventory | ✅ 更新 | ✅ 记录增量 | 正常 |
+| 销售出库 | ✅ 扣减 | ✅ 记录负值 | 正常 |
+| 收货入库 | ✅ 增加（×倍率） | ✅ 记录（×倍率） | 正常 |
+| CSV 导入 | ✅ 设置 | ❌ 记录绝对值 | **不一致！** |
+| 删除收货 | ✅ 回滚（×倍率） | ✅ 回滚（×倍率） | 正常 |
+
+### 4.2 ITEM + HAS_NO_STOCK（无库存服务商品）
+
+| 操作 | item_quantities | inventory 流水 | 说明 |
+|------|----------------|---------------|------|
+| postSave 调整 | ✅ 仍可写入 | ✅ 仍可记录 | **逻辑矛盾：既然是无库存，为什么还能写？** |
+| postSaveInventory | ✅ 仍可写入 | ✅ 仍可记录 | **逻辑矛盾** |
+| 销售出库 | ❌ 不操作 | ❌ 不操作 | 正常（stock_type 拦截） |
+| 收货入库 | ✅ 仍可写入 | ✅ 仍可记录 | **逻辑矛盾** |
+| CSV 导入 | ✅ 仍可写入 | ❌ 记录绝对值 | **逻辑矛盾 + 不一致** |
+| 删除收货 | ✅ 仍可回滚 | ✅ 仍可回滚 | 正常（反向操作抵消） |
+
+### 4.3 ITEM_TEMP（临时商品）
+
+| 操作 | item_quantities | inventory 流水 | 说明 |
+|------|----------------|---------------|------|
+| postSave 调整 | ✅ 强制清零 | ✅ 记录（清0-原值） | 强制约束生效 |
+| postSaveInventory | ✅ 仍可写入 | ✅ 仍可记录 | **无拦截！用户可绕过强制清零** |
+| 销售出库 | ❌ 不操作 | ❌ 不操作 | 正常（因强制 HAS_NO_STOCK） |
+| 收货入库 | ✅ 不变（×0） | ✅ 记录 0 值 | 产生无意义流水 |
+| CSV 导入 | ✅ 仍可写入 | ❌ 记录绝对值 | **无拦截** |
+| 删除收货 | ✅ 不变（×0） | ✅ 记录 0 值 | 产生无意义流水 |
+
+### 4.4 ITEM_KIT（套装商品）
+
+| 操作 | item_quantities | inventory 流水 | 说明 |
+|------|----------------|---------------|------|
+| 销售套装 | ❌ 套装本身不扣 | ❌ 套装本身不记 | 正确（通过子商品扣减） |
+| 收货入库 | ✅ 套装也入库 | ✅ 套装也记流水 | **通常不合逻辑** |
+
+---
+
+## 5. 负库存边界检查
+
+### 5.1 唯一的检查点：Sale_lib::out_of_stock()
 
 **位置**: [Sale_lib.php::out_of_stock()](file:///d:/fz/0601-1/solo-dogfeeding/code/12-opensourcepos/app/Libraries/Sale_lib.php#L1193-L1212)
 
@@ -277,14 +500,15 @@ public function out_of_stock(int $item_id, int $item_location): string
     if ($item_id != -1) {
         $item_info = $this->item->get_info_by_id_or_number($item_id);
         
+        // 只检查 HAS_STOCK 商品
         if ($item_info->stock_type == HAS_STOCK) {
             $item_quantity = $this->item_quantity->get_item_quantity($item_id, $item_location)->quantity;
             $quantity_added = $this->get_quantity_already_added($item_id, $item_location);
             
             if ($item_quantity - $quantity_added < 0) {
-                return lang('Sales.quantity_less_than_zero');  // 库存不足
+                return lang('Sales.quantity_less_than_zero');    // 库存不足
             } elseif ($item_quantity - $quantity_added < $item_info->reorder_level) {
-                return lang('Sales.quantity_less_than_reorder_level');  // 低于预警线
+                return lang('Sales.quantity_less_than_reorder_level');  // 低于预警
             }
         }
     }
@@ -292,98 +516,228 @@ public function out_of_stock(int $item_id, int $item_location): string
 }
 ```
 
-### 4.2 检查时机
+### 5.2 检查时机 —— 仅在加入购物车时
 
-| 场景 | 检查位置 | 是否阻止操作 |
-|------|----------|------------|
-| 添加商品到购物车 | [Sale_lib.php::add_item()](file:///d:/fz/0601-1/solo-dogfeeding/code/12-opensourcepos/app/Libraries/Sale_lib.php#L1346) | 仅警告，不阻止 |
-| 添加套装商品到购物车 | [Sale_lib.php::add_item_kit()](file:///d:/fz/0601-1/solo-dogfeeding/code/12-opensourcepos/app/Libraries/Sale_lib.php#L1346) | 仅警告，不阻止 |
-| 完成销售时 | 无检查 | 直接扣减 |
+| 操作 | 触发检查的位置 | 效果 |
+|------|--------------|------|
+| 添加单品到购物车 | [Sale_lib.php::add_item()](file:///d:/fz/0601-1/solo-dogfeeding/code/12-opensourcepos/app/Libraries/Sale_lib.php) 返回的 cart 中包含 `out_of_stock` 字段 | 前端显示警告，**不阻止** |
+| 添加套装到购物车 | [Sale_lib.php::add_item_kit()](file:///d:/fz/0601-1/solo-dogfeeding/code/12-opensourcepos/app/Libraries/Sale_lib.php) 对子商品逐个检查 | 同上 |
+| 完成销售扣减库存 | **无检查** | 直接扣减，可能变负数 |
+| 手动调整库存 | **无检查** | 可随意设置为负值 |
+| CSV 导入库存 | **无检查** | 可随意设置为负值 |
 
-### 4.3 负库存边界问题
+### 5.3 负库存可能出现的路径
 
-**问题 1**: 检查仅在前端添加商品时进行，**实际扣减库存时无二次检查**
+```
+路径1：并发销售（最常见）
+  收银员A：检查库存 → 有货 10
+  收银员B：检查库存 → 有货 10（同一时间）
+  收银员A：完成销售 → 扣减 10 → 库存 0
+  收银员B：完成销售 → 扣减 10 → 库存 -10 ❌
 
-```php
-// Sale.php::save_value() - 实际扣减时没有检查库存是否为负
-$item_quantity->save_value([
-    'quantity' => $item_quantity_data->quantity - $item_data['quantity'],  // 可能变成负数
-    // ...
-]);
+路径2：postSaveInventory 直接输入负数
+  用户直接输入 newquantity = -50
+  → 库存直接减少 50 → 可能为负 ❌
+
+路径3：postSave 手动输入目标值为负
+  用户在 quantity_1 输入 -10
+  → item_quantities = -10
+  → 流水记录 -10 - 原值 ❌
+
+路径4：CSV 导入负值
+  location_仓库1 填 -20
+  → 库存直接设为 -20 ❌
+
+路径5：删除收货（正常回滚但可能超出现有库存）
+  收货入库 100 → 销售出库 80 → 库存 20
+  删除该收货单 → 回滚 -100 → 库存 20 - 100 = -80 ❌
+  （但这是业务上合理的反向操作，是否允许需业务决策）
 ```
 
-**问题 2**: 并发场景下的检查失效
+---
 
-购物车检查时的库存数量，与实际扣减时的库存数量可能不一致（其他销售已扣减）。
+## 6. 一致性问题汇总与风险评级
 
-**问题 3**: 手动调整和收货/删除操作无负库存检查
+### 6.1 数据不一致风险矩阵
 
-- `postSave()` 和 `postSaveInventory()` 可以将库存设为任意值（包括负数）
-- 删除销售时会直接加回库存，无检查
+| 风险点 | 影响范围 | 严重程度 | 发生概率 |
+|--------|---------|---------|---------|
+| CSV 导入 trans_inventory 存绝对值 | 所有通过 CSV 导入的商品 | 🔴 高 | 🔴 高 |
+| postSave / postSaveInventory 操作顺序相反 | 所有手动调整商品 | 🟡 中 | 🟡 中 |
+| postSave / postSaveInventory 无事务 | 所有手动调整商品 | 🟡 中 | 🟠 低（但可能发生） |
+| 删除收货无 stock_type 检查 | HAS_NO_STOCK 商品的收货 | 🟡 中 | 🟠 低 |
+| 收货入库无 stock_type 检查 | HAS_NO_STOCK 商品的收货 | 🟡 中 | 🟡 中 |
+| postSaveInventory 无类型检查 | ITEM_TEMP / HAS_NO_STOCK | 🟡 中 | 🟡 中 |
+| ITEM_TEMP 收货产生 0 值流水 | ITEM_TEMP 商品的收货 | 🟢 低 | 🟡 中 |
+| 销售实际扣减无二次库存检查 | 高并发销售场景 | 🔴 高 | 🟡 中 |
 
-## 5. 一致性问题与风险
-
-### 5.1 数据不一致的风险点
-
-| 风险点 | 位置 | 说明 |
-|--------|------|------|
-| 操作顺序不一致 | `postSave()` vs `postSaveInventory()` | 前者先更数量后插流水，后者相反 |
-| 缺少事务包裹 | `postSave()`, `postSaveInventory()` | 两个操作不在事务中，可能部分成功部分失败 |
-| 删除商品时的重置 | [Item.php::delete()](file:///d:/fz/0601-1/solo-dogfeeding/code/12-opensourcepos/app/Models/Item.php#L484-L504) | 先重置 `item_quantities`，后插入 `inventory` 流水 |
-
-### 5.2 删除商品时的库存重置
-
-```php
-// Item.php::delete() (Lines 486-499)
-$this->db->transStart();
-
-// 1. 重置 item_quantities 为 0
-$item_quantity = model(Item_quantity::class);
-$item_quantity->reset_quantity($item_id);
-
-// 2. 标记商品为已删除
-$builder->where('item_id', $item_id);
-$success = $builder->update(['deleted' => 1]);
-
-// 3. 插入 inventory 流水（冲减当前库存）
-$inventory = model(Inventory::class);
-$success &= $inventory->reset_quantity($item_id);
-
-$this->db->transComplete();
-```
-
-### 5.3 理论校验公式
-
-为验证一致性，可执行以下 SQL 查询：
+### 6.2 一致性校验 SQL
 
 ```sql
--- 查询库存数量与流水汇总不一致的记录
+-- 1. 库存数量 vs 流水汇总 一致性检查（核心）
 SELECT 
     iq.item_id,
+    i.name,
+    i.stock_type,
+    i.item_type,
     iq.location_id,
+    sl.location_name,
     iq.quantity AS current_quantity,
     COALESCE(SUM(inv.trans_inventory), 0) AS inventory_sum,
     iq.quantity - COALESCE(SUM(inv.trans_inventory), 0) AS diff
 FROM item_quantities iq
+JOIN items i ON i.item_id = iq.item_id
+LEFT JOIN stock_locations sl ON sl.location_id = iq.location_id
 LEFT JOIN inventory inv ON inv.trans_items = iq.item_id AND inv.trans_location = iq.location_id
 GROUP BY iq.item_id, iq.location_id
-HAVING diff != 0;
+HAVING diff != 0
+ORDER BY ABS(diff) DESC;
+
+-- 2. 找出 HAS_NO_STOCK 但有库存数据的异常商品
+SELECT 
+    i.item_id,
+    i.name,
+    i.stock_type,
+    i.item_type,
+    iq.location_id,
+    iq.quantity
+FROM items i
+JOIN item_quantities iq ON iq.item_id = i.item_id
+WHERE i.stock_type = 1  -- HAS_NO_STOCK
+  AND iq.quantity != 0;
+
+-- 3. 找出 ITEM_TEMP 但有库存数据的异常商品
+SELECT 
+    i.item_id,
+    i.name,
+    i.item_type,
+    i.stock_type,
+    iq.location_id,
+    iq.quantity
+FROM items i
+JOIN item_quantities iq ON iq.item_id = i.item_id
+WHERE i.item_type = 3  -- ITEM_TEMP
+  AND iq.quantity != 0;
+
+-- 4. 找出 inventory 表中 trans_inventory=0 的无意义记录
+SELECT 
+    trans_id,
+    trans_items,
+    trans_location,
+    trans_date,
+    trans_comment
+FROM inventory
+WHERE trans_inventory = 0;
 ```
 
-## 6. 改进建议
+---
 
-### 6.1 代码层面改进
+## 7. 改进建议（按优先级排序）
 
-1. **统一操作顺序**: 所有库存调整都采用相同的顺序（建议先插流水后更数量，或相反）
-2. **添加事务包裹**: `postSave()` 和 `postSaveInventory()` 应使用数据库事务
-3. **增加负库存二次检查**: 在 `Sale.php::save_value()` 实际扣减前再次检查库存
-4. **使用乐观锁或行锁**: 并发场景下防止超卖
+### 7.1 紧急修复（高优先级）
 
-### 6.2 数据校验
+**① CSV 导入：trans_inventory 改为存储增量而非绝对值**
 
-定期运行一致性校验脚本，及时发现并修复不一致数据。
+```php
+// 修改 save_inventory_quantities()
+if (!empty($row["location_$location_name"]) || $row["location_$location_name"] === '0') {
+    $new_quantity = $row["location_$location_name"];
+    $old_quantity = $this->item_quantity->get_item_quantity($item_data['item_id'], $location_id)->quantity;
+    
+    $item_quantity_data['quantity'] = $new_quantity;
+    $success &= $this->item_quantity->save_value($item_quantity_data, ...);
+    
+    // ✅ 存差值，不是绝对值
+    $csv_data['trans_inventory'] = $new_quantity - $old_quantity;
+    $success &= (bool)$this->inventory->insert($csv_data, false);
+}
+```
 
-### 6.3 业务规则明确
+**② 销售扣减时增加二次库存检查（防并发）**
 
-- 明确是否允许负库存（目前代码逻辑上允许，但前端有警告）
-- 明确负库存的处理策略（阻止、警告、允许）
+在 `Sale.php::save_value()` 实际扣减前增加检查，或使用数据库行锁。
+
+### 7.2 重要修复（中优先级）
+
+**③ 统一 stock_type 检查，所有入库操作加拦截**
+
+```php
+// 在 Receiving.php::save_value() 收货入库前增加
+if ($cur_item_info->stock_type != HAS_STOCK) {
+    continue;  // 跳过非库存商品的收货入库处理
+}
+```
+
+```php
+// 在 Items.php::postSaveInventory() 调整库存前增加
+if ($cur_item_info->stock_type != HAS_STOCK || $cur_item_info->item_type == ITEM_TEMP) {
+    return $this->response->setJSON(['success' => false, 'message' => lang('Items.item_not_stock_type')]);
+}
+```
+
+**④ postSave 和 postSaveInventory 增加事务包裹**
+
+**⑤ 统一操作顺序**：建议所有场景采用「先插流水 → 后更数量」或统一相反，不再混用
+
+### 7.3 优化修复（低优先级）
+
+**⑥ 删除 CSV 导入中新建商品时 trans_inventory=0 的记录**：创建商品时初始化库存为0无需记录流水，除非有实际变化
+
+**⑦ 删除 ITEM_TEMP 收货时产生的 0 值流水**：增加判断 `if ($items_received != 0)` 才插入流水
+
+---
+
+## 8. 附录：数据流全景图
+
+### 8.1 收货完整链路（含 receiving_quantity）
+
+```
+用户添加商品到收货车
+    ↓
+Receiving_lib::add_item()
+  └─ 读取商品的 receiving_quantity 作为默认值（可修改）
+  └─ 存入 recv_cart session 数组
+    ↓
+用户完成收货，点击提交
+    ↓
+Receivings::postComplete()
+  └─ Receiving_lib::get_cart() 获取购物车数据
+  └─ Receiving::save_value() 执行入库
+      ├─ items_received = quantity × receiving_quantity
+      ├─ 更新 item_quantities += items_received
+      ├─ 插入 inventory 流水: trans_inventory = items_received
+      └─ 写入 receivings / receivings_items 表
+```
+
+### 8.2 商品创建/编辑链路
+
+```
+postSave()
+  ├─ 处理 item_type
+  │   ├─ ITEM_TEMP → 强制 stock_type=HAS_NO_STOCK, receiving_quantity=0
+  │   └─ 其他类型 → receiving_quantity=0? → 强制为 1
+  ├─ 保存 items 表
+  └─ 遍历仓库位置更新库存
+      ├─ ITEM_TEMP → updated_quantity = 0
+      ├─ 比较新旧数量
+      │   ├─ 更新 item_quantities（先）
+      │   └─ 插入 inventory 流水（后）: 存差值
+      └─ ⚠️ 无事务，不检查 stock_type
+```
+
+### 8.3 销售出库链路
+
+```
+Sale_lib::add_item() → out_of_stock() 检查（仅警告）
+    ↓
+完成销售 Sales::postComplete()
+    ↓
+Sale::save_value()
+  └─ transStart() 开启事务
+  └─ 遍历购物车
+      ├─ 检查 stock_type == HAS_STOCK && sale_status == COMPLETED
+      │   ├─ 更新 item_quantities -= quantity（先）
+      │   ├─ 插入 inventory: trans_inventory = -quantity（后）
+      │   └─ ⚠️ 无二次库存检查
+      └─ transComplete() 提交事务
+```
