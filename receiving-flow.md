@@ -189,6 +189,52 @@ $inventory->insert($inv_data, false);
 
 `trans_comment` 字段格式为 `RECV {receiving_id}`，用于追溯来源。
 
+### 3.4 receiving_quantity 的来源与数据流
+
+`receiving_quantity`（包装规格）的取值来源有三层：
+
+```
+1. 商品默认值（items 表）
+   ↓ [Receiving_lib.php#L317-L319]
+2. 加入购物车时默认使用商品表值，可被显式覆盖
+   ↓ [Receiving_lib.php#L342]
+3. 存入 Session 购物车 → 保存时写入 receivings_items 表
+   ↓ [Receiving.php#L144]
+4. 删除时从 receivings_items 表读出并用于回滚
+```
+
+**来源 1：商品默认值**
+```php
+// Receiving_lib.php#L308-L319
+if ($itemInfo->receiving_quantity == 0 || $itemInfo->receiving_quantity == 1) {
+    $receivingQuantityChoices = [1 => 'x1'];     // 只提供 x1 选项
+} else {
+    $receivingQuantityChoices = [
+        to_quantity_decimals($itemInfo->receiving_quantity) => 'x' . $itemInfo->receiving_quantity,
+        1 => 'x1'
+    ];
+}
+
+if (is_null($receivingQuantity)) {
+    $receivingQuantity = $itemInfo->receiving_quantity;  // 用商品默认值
+}
+```
+
+**来源 2：用户编辑覆盖**
+```php
+// Receiving_lib.php#L371-L392
+public function edit_item($line, ..., float $receiving_quantity): bool
+{
+    $line['receiving_quantity'] = $receiving_quantity;  // 用户可修改为任意值（包括 0~1 之间）
+}
+```
+
+因此 `receiving_quantity` 可能的值包括：
+- 商品表定义的包装规格（如 6、12、24 等）
+- 1（按个采购）
+- 0（商品未设置包装规格的默认值）
+- **0 < rq < 1 的小数**（用户手动编辑，例如 0.5 表示半箱，理论上不推荐但代码允许）
+
 ---
 
 ## 四、成本计算方式：移动加权平均法
