@@ -193,10 +193,10 @@ $inventory->insert($inv_data, false);
 
 ### 3.4 receiving_quantity 的来源与数据流
 
-`receiving_quantity`（包装规格）的取值来源有三层：
+`receiving_quantity`（包装规格，即"每箱多少个"）的取值来源有三层，并且需要注意它在**UI 展示层**和**库存计算层**的分支判断是两套独立逻辑：
 
 ```
-1. 商品默认值（items 表）
+1. 商品默认值（items 表.receiving_quantity）
    ↓ [Receiving_lib.php#L317-L319]
 2. 加入购物车时默认使用商品表值，可被显式覆盖
    ↓ [Receiving_lib.php#L342]
@@ -205,37 +205,61 @@ $inventory->insert($inv_data, false);
 4. 删除时从 receivings_items 表读出并用于回滚
 ```
 
-**来源 1：商品默认值**
+**来源 1：商品默认值（UI 展示逻辑）**
+
 ```php
 // Receiving_lib.php#L308-L319
+// —— 这是「前端下拉选项生成逻辑」，和库存计算无关 ——
 if ($itemInfo->receiving_quantity == 0 || $itemInfo->receiving_quantity == 1) {
-    $receivingQuantityChoices = [1 => 'x1'];     // 只提供 x1 选项
+    // 商品未设置包装规格（=0）或规格就是1个 → UI 只提供 x1 选项
+    $receivingQuantityChoices = [1 => 'x1'];
 } else {
+    // 商品已定义包装规格（如 6/12/24）→ UI 提供规格值和 x1 两个选项
     $receivingQuantityChoices = [
-        to_quantity_decimals($itemInfo->receiving_quantity) => 'x' . $itemInfo->receiving_quantity,
+        to_quantity_decimals($itemInfo->receiving_quantity) => 'x' . to_quantity_decimals($itemInfo->receiving_quantity),
         1 => 'x1'
     ];
 }
 
 if (is_null($receivingQuantity)) {
-    $receivingQuantity = $itemInfo->receiving_quantity;  // 用商品默认值
+    $receivingQuantity = $itemInfo->receiving_quantity;  // 未传参则用商品默认值
 }
 ```
 
+> ⚠️ **重要区分**：上面 `== 0 || == 1` 是**UI 下拉选项的展示判断**，**不是库存计算分支**。库存计算时 0 和 1 的处理完全不同（见下文来源 3）。
+
 **来源 2：用户编辑覆盖**
+
 ```php
 // Receiving_lib.php#L371-L392
 public function edit_item($line, ..., float $receiving_quantity): bool
 {
-    $line['receiving_quantity'] = $receiving_quantity;  // 用户可修改为任意值（包括 0~1 之间）
+    $line['receiving_quantity'] = $receiving_quantity;  // 用户可手动修改为任意值
 }
 ```
+
+**来源 3：保存入库（库存计算逻辑，与 UI 分支独立）**
+
+```php
+// Receiving.php#L144 + L154
+'receiving_quantity' => $item_data['receiving_quantity'],   // 原样存入明细表
+// 库存计算走独立的三元判断：
+$items_received = $item_data['receiving_quantity'] != 0
+    ? $item_data['quantity'] * $item_data['receiving_quantity']
+    : $item_data['quantity'];
+```
+
+> 这里只有两路分支：
+> - **分支A（rq ≠ 0）**：包含 rq=0.5、rq=1、rq=12 等一切非零值，全部走乘法 `qty × rq`
+> - **分支B（rq = 0）**：仅 rq=0，走兜底 `qty`
+>
+> 即 rq=1 属于分支A（乘法），rq=0 属于分支B（兜底），**两者在库存计算中不是同一条分支**，和 UI 层的 `||` 判断语义不同。
 
 因此 `receiving_quantity` 可能的值包括：
 - 商品表定义的包装规格（如 6、12、24 等）
 - 1（按个采购）
 - 0（商品未设置包装规格的默认值）
-- **0 < rq < 1 的小数**（用户手动编辑，例如 0.5 表示半箱，理论上不推荐但代码允许）
+- 0 < rq < 1 的小数（用户手动编辑，理论不推荐但代码允许）
 
 ---
 
@@ -689,37 +713,41 @@ public function clear_all(): void
 ### 9.1 保存流程
 
 ```
-postComplete() [Receivings.php]
-    ↓
-save_value(cart, supplier_id, employee_id, ...) [Receiving.php]
-    ├─ INSERT INTO receivings ...
-    ├─ 遍历购物车商品：
-    │   ├─ INSERT INTO receivings_items ...
-    │   ├─ 计算 items_received = rq != 0 ? qty*rq : qty
-    │   ├─ change_cost_price() [Item.php] ← 移动加权平均
-    │   │   └─ UPDATE items SET cost_price = ?
-    │   ├─ save_value() [Item_quantity.php]
-    │   │   └─ INSERT/UPDATE item_quantities SET quantity = ?
-    │   └─ insert() [Inventory.php]
-    │       └─ INSERT INTO inventory ...
-    └─ 返回事务结果
+postComplete() [Receivings.php#L325]
+    ↓ 从 Session 取出购物车、供应商、备注等
+save_value(cart, supplier_id, employee_id, ...) [Receiving.php#L103]
+    ├─ 事务开始
+    ├─ INSERT INTO receivings (主记录)
+    └─ 遍历购物车商品，每个商品执行：
+         ├─ INSERT INTO receivings_items（明细，含 rq 原样保存）
+         ├─ 计算 items_received = rq != 0 ? qty*rq : qty   [L154]
+         ├─ IF (新旧价格不同 AND 配置开启):   [L157 前置判断]
+         │    └─ change_cost_price(item_id, items_received, new_price, old_price)  [Item.php]
+         │         └─ 查 item_quantities（收货前的快照）→ 计算加权平均 → UPDATE items.cost_price
+         ├─ item_quantity->save_value(旧库存 + items_received)   [L163]
+         │    └─ INSERT/UPDATE item_quantities
+         └─ inventory->insert(items_received)   [L183]
+              └─ INSERT INTO inventory（trans_comment = "RECV {id}"）
+    └─ 事务提交
 ```
 
 ### 9.2 取消/删除流程
 
 ```
-postDelete(receiving_id) [Receivings.php]
-    ↓
-delete_list(receiving_ids) [Receiving.php]
-    ↓
-delete_value(receiving_id, employee_id, update_inventory) [Receiving.php]
-    ├─ get_receiving_items(receiving_id)
-    ├─ 遍历收货明细：
-    │   ├─ INSERT INTO inventory (反向记录，值 = qty*(-rq)，无兜底)
-    │   └─ change_quantity(item_id, location_id, qty*(-rq)) [Item_quantity.php]
-    │       └─ UPDATE item_quantities SET quantity = ?
+postDelete(receiving_id, update_inventory=true) [Receivings.php#L288]
+    ↓ 第一层：总开关（默认 true）
+delete_list(receiving_ids, employee_id, update_inventory) [Receiving.php#L196]
+    ↓ 事务开始，逐个调用
+delete_value(receiving_id, employee_id, update_inventory) [Receiving.php#L218]
+    ├─ IF update_inventory = true:              ← 第一层判断
+    │    ├─ get_receiving_items(receiving_id)   从 receivings_items 读出明细（含 rq）
+    │    └─ 遍历明细（第二层：rq 计算逻辑）：
+    │         ├─ INSERT INTO inventory
+    │         │    trans_inventory = qty * (-rq)   无兜底，rq=0 时=0 [L238]
+    │         └─ item_quantity->change_quantity(item_id, location_id, qty*(-rq))  [L244]
     ├─ DELETE FROM receivings_items WHERE receiving_id = ?
     └─ DELETE FROM receivings WHERE receiving_id = ?
+    └─ 事务提交
 ```
 
 ---
