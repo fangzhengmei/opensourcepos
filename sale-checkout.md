@@ -185,6 +185,112 @@ public function get_item_discount(string $quantity, string $price, string $disco
 
 遍历购物车中所有折扣大于 0 的商品，累加折扣金额。
 
+### 4.6 套装折扣与客户折扣的优先级比较（深度分析）
+
+折扣优先级的比较并非简单的覆盖关系，而是在两个不同阶段分别处理，逻辑较为复杂。
+
+#### 阶段一：添加商品时的比较（postAdd → add_item）
+
+**位置**：[Sales::postAdd()](file:///d:/fz/0601-1/solo-dogfeeding/code/11-opensourcepos/app/Controllers/Sales.php#L507-L547)
+
+首先取默认折扣或客户折扣作为基准：
+
+```php
+// 初始值：系统默认折扣
+$discount = $this->config['default_sales_discount'];
+$discount_type = $this->config['default_sales_discount_type'];
+
+// 如已选客户且客户有折扣 → 替换为客户折扣
+$customer_id = $this->sale_lib->get_customer();
+if ($customer_id != NEW_ENTRY) {
+    $customer_discount = $this->customer->get_info($customer_id)->discount;
+    $customer_discount_type = $this->customer->get_info($customer_id)->discount_type;
+    if ($customer_discount != '') {
+        $discount = $customer_discount;        // 覆盖
+        $discount_type = $customer_discount_type;
+    }
+}
+```
+
+如果添加的是套装商品，进一步与套装折扣比较：
+
+```php
+if ($this->item_kit->is_valid_item_kit(...)) {
+    if ($discount_type == $item_kit_info->kit_discount_type) {
+        // 折扣类型相同 → 取数值大的（折扣越大越优惠）
+        if ($item_kit_info->kit_discount > $discount) {
+            $discount = $item_kit_info->kit_discount;
+        }
+    } else {
+        // 折扣类型不同 → 无条件使用套装折扣
+        $discount = $item_kit_info->kit_discount;
+        $discount_type = $item_kit_info->kit_discount_type;
+    }
+}
+```
+
+**比较规则总结**：
+
+| 场景 | 结果 |
+|------|------|
+| 客户折扣类型 == 套装折扣类型 | 取数值较大者（更大折扣优先） |
+| 客户折扣类型 != 套装折扣类型 | 无条件使用套装折扣（套装优先） |
+| 无客户折扣 | 系统默认折扣 < 套装折扣时取套装 |
+
+**设计意图**：套装折扣是捆绑销售的特定优惠，优先级最高；当类型相同时，遵循「取更优惠」原则。
+
+#### 阶段二：添加商品时在 PRICE_MODE_KIT 下的再次处理
+
+**位置**：[Sale_lib::add_item()](file:///d:/fz/0601-1/solo-dogfeeding/code/11-opensourcepos/app/Libraries/Sale_lib.php#L1055-L1078)
+
+在 `add_item()` 中，如果 `$price_mode == PRICE_MODE_KIT`，还会对折扣做二次调整：
+
+```php
+if ($price_mode == PRICE_MODE_KIT) {
+    // 情况1：根据价格选项，某些组件商品价格为 0 → 折扣也强制为 0
+    if (!($kit_price_option == PRICE_OPTION_ALL || ...)) {
+        $price = '0.00';
+        $applied_discount = '0.00';
+    }
+    // 情况2：价格为 0 的商品不打折扣
+    if ($price == '0.00') {
+        $applied_discount = '0.00';
+    }
+    // 情况3：固定折扣不能超过商品单价
+    if ($discount_type == FIXED) {
+        if ($applied_discount > $price) {
+            $applied_discount = $price;          // 截断到单价
+            $discount -= $applied_discount;      // 余额留给后续商品（引用传参）
+        } else {
+            $discount = 0;                       // 整单折扣已用完
+        }
+    }
+}
+```
+
+**关键点**：
+- `$discount` 是引用传参（`string &$discount`），在处理一个组件时消耗的金额会从总额度中扣减
+- 固定折扣模式下，折扣金额会在套装各组件间「分摊」，单件折扣上限为该件单价
+
+#### 阶段三：选择客户时的回溯应用（apply_customer_discount）
+
+**位置**：[Sale_lib::apply_customer_discount()](file:///d:/fz/0601-1/solo-dogfeeding/code/11-opensourcepos/app/Libraries/Sale_lib.php#L1478-L1496)
+
+```php
+foreach ($items as &$item) {
+    // 只对折扣为 0 的商品应用客户折扣
+    if ($item['discount'] == 0.0) {
+        $item['discount'] = $discount;
+        // 重新计算 total 和 discounted_total
+    }
+}
+```
+
+**关键行为**：只覆盖 `discount == 0` 的商品行。也就是说：
+- 先加商品后选客户 → 客户折扣仅应用于原本无折扣的商品
+- 已有折扣（含套装折扣、手动折扣）的商品不会被覆盖
+- 先选客户后加商品 → 客户折扣会在 `postAdd` 阶段作为基准折扣参与套装比较
+
 ---
 
 ## 五、税费计算逻辑
