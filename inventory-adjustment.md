@@ -683,9 +683,23 @@ if ($cur_item_info->stock_type != HAS_STOCK || $cur_item_info->item_type == ITEM
 
 **⑥ 删除 CSV 导入中新建商品时 trans_inventory=0 的记录**：创建商品时初始化库存为0无需记录流水，除非有实际变化
 
-**⑦ 删除 ITEM_TEMP 收货时产生的 0 值流水**：增加判断 `if ($items_received != 0)` 才插入流水
+**⑦ 删除无意义流水**：save_value() 和 delete_value() 中都增加判断 `if ($items_received != 0)` / `if ($trans_inventory != 0)` 才插入 inventory
 
-**⑧ delete_value 与 save_value 统一 receiving_quantity=0 的处理逻辑**（详见 8.2 节的不一致 Bug）
+**⑧ delete_value 与 save_value 统一 receiving_quantity=0 的处理逻辑**（详见 8.3 节的不对称 Bug）：
+
+```php
+// Receiving.php::delete_value() 修改为与 save_value() 对称的退化逻辑
+$rollback_quantity = $item['receiving_quantity'] != 0
+    ? $item['quantity_purchased'] * $item['receiving_quantity']
+    : $item['quantity_purchased'];
+
+$trans_inventory = -$rollback_quantity;
+$item_quantity->change_quantity($item['item_id'], $item['item_location'], -$rollback_quantity);
+```
+
+**⑨ 修复 add_item 时 receiving_quantity=0 与前端下拉选项脱节的问题**（详见 8.2 节）：在 `Receiving_lib.php::add_item()` 中，如果商品的 `receiving_quantity` 为 0 且不在 `$receivingQuantityChoices` 选项中，应自动将 cart 中的值设为选项的第一个值（1），而不是保留 0。这样能避免金额计算（`get_item_total`）得出 0 元的 Bug。
+
+**⑩ add_item 入口增加 stock_type 拦截**：在 `Receiving_lib::add_item()` 和 `add_item_kit()` 开头增加对 stock_type 的检查，直接 return false，阻止无库存商品加入收货车，从源头规避所有下游问题。
 
 ---
 
@@ -734,19 +748,19 @@ foreach ($items as $line => $item_data) {
 
 #### 8.1.2 根本原因推测
 
-从迁移脚本 [20170501000000_initial_schema.php](file:///d:/fz/0601-1/solo-dogfeeding/code/12-opensourcepos/app/Database/Migrations/20170501000000_initial_schema.php) 和早期 SQL 迁移可以看出：
+从迁移脚本和早期 SQL 迁移可以看出：
 
-1. **`receiving_quantity` 是后来加的字段**：`phppos_migrate.sql` 第79行显示，从旧版本迁移时 `receiving_quantity` 被硬编码为 `1`
+1. **`receiving_quantity` 是后来加的字段**：旧版本迁移时 `receiving_quantity` 被硬编码为 `1`
 2. **`stock_type`/`item_type` 是更晚才加入的概念**：引入时只在销售侧加了拦截，收货侧遗漏了
 3. **ITEM_TEMP 是最新功能**：`postSave()` 中对 ITEM_TEMP 做了强制约束，但这种约束没有「扩散」到收货/库存调整等其他入口
 
-### 8.2 ITEM_TEMP 的 receiving_quantity 在收货车中的真实值：两条不同路径
+### 8.2 ITEM_TEMP 的 receiving_quantity 在收货车中的真实值：两条路径 + 金额脱节 Bug
 
-ITEM_TEMP 商品在收货车中的 `receiving_quantity` 并非始终为 0，取决于用户**是否编辑过该行**。
+ITEM_TEMP 商品在收货车中的 `receiving_quantity` 并非始终为 0，取决于用户**是否编辑过该行**。且两条路径都会导致问题。
 
 #### 8.2.1 代码源头分析
 
-**位置**: [Receiving_lib.php::add_item()](file:///d:/fz/0601-1/solo-dogfeeding/code/12-opensourcepos/app/Libraries/Receiving_lib.php#L308-L343)
+**位置**: [Receiving_lib.php::add_item()](file:///d:/fz/0601-1/solo-dogfeeding/code/12-opensourcepos/app/Libraries/Receiving_lib.php#L308-L345)
 
 ```php
 // Line 308-315: 前端下拉选项的生成（只影响 UI 展示可选范围）
@@ -759,9 +773,22 @@ if (is_null($receivingQuantity)) {
     $receivingQuantity = $itemInfo->receiving_quantity;  // ITEM_TEMP: 实际存 0
 }
 
-// Line 342-343: 存入 cart 数组
+// Line 342-344: 存入 cart 数组，同时计算总额
 'receiving_quantity'         => $receivingQuantity,          // ITEM_TEMP: 0
 'receiving_quantity_choices' => $receivingQuantityChoices,   // ITEM_TEMP: [1 => 'x1']
+'total'                      => $this->get_item_total($quantity, $price, $discount, $discountType, $receivingQuantity)
+```
+
+**位置**: [Receiving_lib.php::get_item_total()](file:///d:/fz/0601-1/solo-dogfeeding/code/12-opensourcepos/app/Libraries/Receiving_lib.php#L485-L497) — 金额计算
+
+```php
+public function get_item_total(float $quantity, float $price, float $discount, ?int $discount_type, float $receiving_quantity): string
+{
+    $extended_quantity = bcmul($quantity, $receiving_quantity);  // receiving_quantity=0 时 = 0
+    $total = bcmul($extended_quantity, $price);                   // total = 0
+    // ...
+    return bcsub($total, $discount_amount);  // 返回 0
+}
 ```
 
 **位置**: [receiving.php](file:///d:/fz/0601-1/solo-dogfeeding/code/12-opensourcepos/app/Views/receivings/receiving.php#L164-L169) — 前端渲染下拉框
@@ -775,31 +802,36 @@ form_dropdown(
 );
 ```
 
-#### 8.2.2 路径 A：添加商品后 **不编辑、不改数量、不改单价，直接提交**
+**位置**: [receipt.php](file:///d:/fz/0601-1/solo-dogfeeding/code/12-opensourcepos/app/Views/receivings/receipt.php#L77) — 小票打印时再次掩盖
 
-| 环节 | receiving_quantity 值 | 说明 |
-|------|----------------------|------|
-| add_item() 存入 cart | **0** | 从 items 表读取的原始值 |
-| 前端下拉框显示 | **显示 x1** | 用户以为是 1，但实际 cart 还是 0（显示与值脱节） |
-| 提交 → save_value() 处理 | **0** | 直接从 session cart 取出 |
-| 存入 receivings_items | **0** | 原样写入数据库 |
-
-#### 8.2.3 路径 B：添加商品后 **编辑过任何字段**（改数量/改单价/改倍率，哪怕只是点一下下拉再失焦）
-
-| 环节 | receiving_quantity 值 | 说明 |
-|------|----------------------|------|
-| add_item() 存入 cart | 0 | 初始同上 |
-| 前端下拉框渲染 | HTML 默认选中 **第一个选项 = 1** | 因为默认值 0 不在选项列表中 |
-| 用户点击提交 form → POST 过来 | **1** | 下拉框实际选中了 1，`parse_quantity($_POST['receiving_quantity']) = 1` |
-| edit_item() 覆盖 cart | **1** | [Receivings.php::postEditItem()](file:///d:/fz/0601-1/solo-dogfeeding/code/12-opensourcepos/app/Controllers/Receivings.php#L197-L221) 中把 POST 值原样写回 cart |
-| 提交 → save_value() 处理 | **1** | 从 session cart 取出 |
-| 存入 receivings_items | **1** | 写入数据库 |
-
-**证据**：[receipt.php](file:///d:/fz/0601-1/solo-dogfeeding/code/12-opensourcepos/app/Views/receivings/receipt.php#L77) 打印收货小票时也用了退化逻辑来「掩盖」脱节：
 ```php
 <td>x <?= $item['receiving_quantity'] != 0 ? to_quantity_decimals($item['receiving_quantity']) : 1 ?></td>
 ```
-小票上显示「x 1」，但 cart/DB 里实际存的是 0！
+→ 小票上显示「x 1」，但 cart/DB 里实际存的是 0！
+
+#### 8.2.2 路径 A：添加商品后 **不编辑、不改数量、不改单价，直接提交**
+
+| 环节 | receiving_quantity 值 | cart total（金额） | 说明 |
+|------|----------------------|-------------------|------|
+| add_item() 存入 cart | **0** | **0 元** | receiving_quantity=0 → `bcmul(qty,0)=0` → 总金额为 0 |
+| 前端下拉框显示 | 显示 x1 | — | 掩盖脱节，用户以为倍率是 1 |
+| 提交 → save_value() 处理 | **0** | — | 直接从 session cart 取出 |
+| 存入 receivings_items | **0** | — | 原样写入数据库 |
+
+**路径 A 的金额-库存脱节 Bug**：金额为 0 元（免费），但 save_value 中会退化为 `items_received = quantity`，库存照样增加。相当于用户可以 0 元入库任意数量商品。
+
+#### 8.2.3 路径 B：添加商品后 **编辑过任何字段**（改数量/改单价/改倍率，哪怕只是点一下下拉再失焦）
+
+| 环节 | receiving_quantity 值 | cart total（金额） | 说明 |
+|------|----------------------|-------------------|------|
+| add_item() 存入 cart | 0 | 0 元 | 初始同上 |
+| 前端下拉框渲染 | HTML 默认选中 **第一个选项 = 1** | — | 因为默认值 0 不在选项列表中 |
+| 用户点击提交 form → POST 过来 | **1** | — | 下拉框实际选中了 1 |
+| edit_item() 覆盖 cart | **1** | `qty × 1 × price` | [Receivings.php::postEditItem()](file:///d:/fz/0601-1/solo-dogfeeding/code/12-opensourcepos/app/Controllers/Receivings.php#L197-L221) 写回 cart，金额用新 rq=1 重算 → 正确 |
+| 提交 → save_value() 处理 | **1** | — | 从 session cart 取出 |
+| 存入 receivings_items | **1** | — | 写入数据库 |
+
+**路径 B 没有金额脱节 Bug**：因为 edit_item 把 receiving_quantity 改成了 1，金额和入库数量都按 `qty × 1` 计算，一致。
 
 ---
 
@@ -807,26 +839,26 @@ form_dropdown(
 
 #### 8.3.1 save_value（入库时）：存在退化逻辑
 
-**代码**: [Receiving.php::save_value()](file:///d:/fz/0601-1/solo-dogfeeding/code/12-opensourcepos/app/Models/Receiving.php#L154-L156)
+**代码**: [Receiving.php::save_value()](file:///d:/fz/0601-1/solo-dogfeeding/code/12-opensourcepos/app/Models/Receiving.php#L154)
 
 ```php
 $items_received = $item_data['receiving_quantity'] != 0
     ? $item_data['quantity'] * $item_data['receiving_quantity']
-    : $item_data['quantity'];    // ✅ receiving_quantity=0 时，退化为 items_received = quantity
+    : $item_data['quantity'];    // receiving_quantity=0 时，退化为 items_received = quantity
 ```
 
 #### 8.3.2 delete_value（删除/回滚时）：**不存在** 退化逻辑
 
-**代码**: [Receiving.php::delete_value()](file:///d:/fz/0601-1/solo-dogfeeding/code/12-opensourcepos/app/Models/Receiving.php#L238-L247)
+**代码**: [Receiving.php::delete_value()](file:///d:/fz/0601-1/solo-dogfeeding/code/12-opensourcepos/app/Models/Receiving.php#L238-L244)
 
 ```php
 $trans_inventory = $item['quantity_purchased'] * (-$item['receiving_quantity']);
-// ❌ receiving_quantity=0 时，直接 = 0，不会退化为 quantity！
+// receiving_quantity=0 时，直接 = 0，不会退化为 quantity！
 
 $item_quantity->change_quantity(
     $item['item_id'],
     $item['item_location'],
-    $item['quantity_purchased'] * (-$item['receiving_quantity'])  // ❌ 同样 = 0
+    $item['quantity_purchased'] * (-$item['receiving_quantity'])  // 同样 = 0
 );
 ```
 
@@ -834,39 +866,42 @@ $item_quantity->change_quantity(
 
 ### 8.4 四条完整推演路径
 
-以下推演均使用 **ITEM_TEMP 商品**（`stock_type=HAS_NO_STOCK`, `receiving_quantity=0`），初始库存=0。
+以下推演均使用 **ITEM_TEMP 商品**（`stock_type=HAS_NO_STOCK`, `receiving_quantity=0`），初始库存=0，单价=10 元。
 
 #### 8.4.1 路径 A：添加后直接提交（不编辑），且 **不删除** 收货单
 
-| 步骤 | 操作 | item_quantities | inventory 流水 | receivings_items.receiving_quantity |
-|------|------|----------------|---------------|-------------------------------------|
-| 初始 | | 0 | SUM = 0 | - |
-| ① | add_item qty=50 | 不变（只在 session） | - | cart: 0 |
-| ② | 直接提交（不走 edit_item） | | | |
-| | save_value 计算：rq=0 → 退化 → items_received=50 | 0 + **50** = 50 | RECV x → **+50** | DB: **0** |
-| 最终 | | **50** ❌ | **50** ❌ | 0 |
+| 步骤 | 操作 | item_quantities | inventory 流水 | receivings_items.rq | 收货单金额 |
+|------|------|----------------|---------------|---------------------|-----------|
+| 初始 | | 0 | SUM = 0 | - | - |
+| ① | add_item qty=50 | 不变（session） | - | cart: 0 | cart total = 0 元 |
+| ② | 直接提交 | | | | |
+| | save_value：rq=0 → 退化 → items_received=50 | 0 + **50** = 50 | RECV x → **+50** | DB: **0** | **0 元** |
+| 最终 | | **50** ❌ | **50** ❌ | 0 | **0 元**（金额与库存脱节） |
 
-**现象**：ITEM_TEMP 商品收货后，库存从 0 变 50，违背设计初衷。但 **表间一致性通过**（50 = 50）。
+**现象**：
+- ITEM_TEMP 商品收货后，库存从 0 变 50，违背设计初衷
+- 表间一致性通过（50 = 50），但业务上错误
+- 用户 0 元免费入库了 50 件
 
 #### 8.4.2 路径 B：添加后编辑过再提交，且 **不删除** 收货单
 
-| 步骤 | 操作 | item_quantities | inventory 流水 | receivings_items.receiving_quantity |
-|------|------|----------------|---------------|-------------------------------------|
-| ① | add_item qty=50 | 不变 | - | cart: 0 |
-| ② | 用户点击刷新按钮触发 edit_item → POST `receiving_quantity=1` | 不变 | - | cart: 被改写成 **1** |
-| ③ | 提交 | | | |
-| | save_value 计算：rq=1 → 50×1=50 | 0 + **50** = 50 | RECV x → **+50** | DB: **1** |
-| 最终 | | **50** ❌ | **50** ❌ | 1 |
+| 步骤 | 操作 | item_quantities | inventory 流水 | receivings_items.rq | 收货单金额 |
+|------|------|----------------|---------------|---------------------|-----------|
+| ① | add_item qty=50 | 不变 | - | cart: 0 | cart total = 0 元 |
+| ② | edit_item：POST `receiving_quantity=1` | 不变 | - | cart: 被改写成 **1** | 重算 → `50 × 1 × 10 = 500` 元 |
+| ③ | 提交 | | | | |
+| | save_value：rq=1 → 50×1=50 | 0 + **50** = 50 | RECV x → **+50** | DB: **1** | **500 元** |
+| 最终 | | **50** ❌ | **50** ❌ | 1 | **500 元**（金额与库存一致） |
 
-**现象**：无论是否编辑，只要不做 stock_type 拦截，ITEM_TEMP 都会入库。区别只是 DB 里存的 `receiving_quantity` 值不同。
+**现象**：无论是否编辑，只要不做 stock_type 拦截，ITEM_TEMP 都会入库。区别只是 DB 里存的 `receiving_quantity` 值和金额是否一致。
 
 #### 8.4.3 路径 A+删除：添加后直接提交 → 再删除收货单（**幽灵库存产生**）
 
-| 步骤 | 操作 | item_quantities | inventory 流水 | receivings_items.receiving_quantity |
-|------|------|----------------|---------------|-------------------------------------|
-| ① | 收货（同 9.4.1） | 50 | RECV x → +50 | DB: 0 |
+| 步骤 | 操作 | item_quantities | inventory 流水 | receivings_items.rq |
+|------|------|----------------|---------------|---------------------|
+| ① | 收货（同 8.4.1） | 50 | RECV x → +50 | DB: 0 |
 | ② | 删除收货单（update_inventory=true） | | | DB 读回: 0 |
-| | delete_value: qty × (-rq) = 50 × (-0) = 0 | 50 + **0** = 50 | Deleting → **0** | - |
+| | delete_value：50 × (-0) = 0 | 50 + **0** = 50 | Deleting → **0** | - |
 | 最终 | | **50** ❌❌ 幽灵库存 | **SUM = 50** ❌❌ | - |
 
 **现象**：
@@ -876,11 +911,11 @@ $item_quantity->change_quantity(
 
 #### 8.4.4 路径 B+删除：添加后编辑过再提交 → 再删除（收支相抵，无幽灵）
 
-| 步骤 | 操作 | item_quantities | inventory 流水 | receivings_items.receiving_quantity |
-|------|------|----------------|---------------|-------------------------------------|
-| ① | 收货（同 9.4.2） | 50 | RECV x → +50 | DB: 1 |
+| 步骤 | 操作 | item_quantities | inventory 流水 | receivings_items.rq |
+|------|------|----------------|---------------|---------------------|
+| ① | 收货（同 8.4.2） | 50 | RECV x → +50 | DB: 1 |
 | ② | 删除收货单（update_inventory=true） | | | DB 读回: 1 |
-| | delete_value: qty × (-rq) = 50 × (-1) = -50 | 50 + **(-50)** = 0 | Deleting → **-50** | - |
+| | delete_value：50 × (-1) = -50 | 50 + **(-50)** = 0 | Deleting → **-50** | - |
 | 最终 | | **0** ✅ | **SUM = 0** ✅ | - |
 
 **现象**：
@@ -894,15 +929,16 @@ $item_quantity->change_quantity(
 #### 8.5.1 入库时（路径 A，receiving_quantity=0）
 
 ```
-输入：ITEM_TEMP 商品，stock_type=HAS_NO_STOCK，receiving_quantity=0，quantity=50
+输入：ITEM_TEMP 商品，stock_type=HAS_NO_STOCK，receiving_quantity=0，quantity=50，price=10
      （添加后直接提交，不编辑）
 
 执行路径：
   1. Receiving_lib::add_item()
      ├─ $itemInfo = item->get_info_by_id_or_number()
      │   └─ ⚠️ 没有任何 stock_type / item_type 判断，直接放行
-     ├─ receiving_quantity_choices = [1 => 'x1']  ← UI 只给 1 选项
+     ├─ receiving_quantity_choices = [1 => 'x1']   ← UI 只给 1 选项
      ├─ receiving_quantity = $itemInfo->receiving_quantity = 0  ← 实际存 0
+     ├─ total = get_item_total(50, 10, ..., 0) = 0  ← ❌ 金额算出来为 0 元
      └─ 存入 session cart
 
   2. Receiving.php::postComplete() → Receiving::save_value()（事务内）
@@ -947,12 +983,12 @@ $item_quantity->change_quantity(
 | ITEM_TEMP 商品不参与库存管理 | `Items.php::postSave()` → 强制 `stock_type=HAS_NO_STOCK` | 销售侧 `Sale.php`、`Sale_lib.php` 有判断；但 **收货侧 `Receiving.php`、`Receiving_lib.php` 完全没写对应的判断** |
 | ITEM_TEMP 商品 `receiving_quantity=0` | `Items.php::postSave()` → 强制设 0 | 本意是「倍率为 0 表示不入库」，但 `Receiving.php::save_value()` 的三元运算符把 0 当「不需要换算」，**自动退化为 quantity，反而真的入库了**，语义完全相反 |
 | ITEM_TEMP 商品库存强制为 0 | `Items.php::postSave()` → `updated_quantity = 0` | **只在保存商品表单时生效**，其他入口（收货、CSV、调库存）都没写这段逻辑 |
-| ITEM_TEMP 收货时前端倍率锁定为 1 | `Receiving_lib.php` → `receiving_quantity_choices = [1 => 'x1']` | **只限制了前端可选值**，后端 cart 实际存的是 items 表读出来的 0，两者脱节；编辑时才被改成 1，导致同一张单据出现两种不同行为 |
+| ITEM_TEMP 收货时前端倍率锁定为 1 | `Receiving_lib.php` → `receiving_quantity_choices = [1 => 'x1']` | **只限制了前端可选值**，后端 cart 实际存的是 items 表读出来的 0，两者脱节；同时 `get_item_total` 用 0 计算出金额为 0，造成「0 元入库」的 Bug |
 | 删除收货时能完全回滚 | `Receiving.php::delete_value()` 的反向操作设计 | 只在 `receiving_quantity >= 1` 时对称；**=0 时 save_value 有退化但 delete_value 没有**，产生不对称 → 幽灵库存 |
 
 **一句话总结根本原因**：
 
-> `stock_type` 是销售侧（Sale 模块）引入的概念，但收货侧（Receiving 模块）在开发和后续重构时，**从未同步加入 stock_type 检查**。ITEM_TEMP 作为更晚的功能，其「强制 receiving_quantity=0」的约束与 `save_value` 中已有的「=0 就退化」的旧逻辑发生了语义冲突。
+> `stock_type` 是销售侧（Sale 模块）引入的概念，但收货侧（Receiving 模块）在开发和后续重构时，**从未同步加入 stock_type 检查**。ITEM_TEMP 作为更晚的功能，其「强制 receiving_quantity=0」的约束与 `save_value` 中已有的「=0 就退化」的旧逻辑发生了语义冲突，同时还引发了金额计算（`get_item_total`）的脱节。
 
 ---
 
@@ -963,9 +999,9 @@ $item_quantity->change_quantity(
 HAVING iq.quantity - COALESCE(SUM(inv.trans_inventory), 0) != 0
 ```
 
-对于上述 ITEM_TEMP 场景：
-- `item_quantities.quantity = 100`（幽灵库存）
-- `SUM(trans_inventory) = 100`（入库 100 + 删除回滚 0 = 100）
+对于上述 ITEM_TEMP 场景（路径 A+删除）：
+- `item_quantities.quantity = 50`（幽灵库存）
+- `SUM(trans_inventory) = 50`（入库 50 + 删除回滚 0 = 50）
 - **差值 = 0 → 校验通过！**
 
 因为 save_value 和 delete_value 虽然逻辑相反、数量不匹配，但两者都「同时污染」了两张表，所以表间校验 SQL 查不出问题。需要结合 **业务规则校验** 才能发现：
@@ -981,7 +1017,7 @@ WHERE (i.stock_type = 1 OR i.item_type = 3)
 
 ---
 
-## 9. 附录：数据流全景图（补充）
+## 9. 附录：数据流全景图
 
 ### 9.1 收货完整链路（含 receiving_quantity，标注 Bug 点）
 
@@ -990,24 +1026,26 @@ WHERE (i.stock_type = 1 OR i.item_type = 3)
     ↓
 Receiving_lib::add_item()
   └─ ❌ 无 stock_type 检查，任何商品都能加入
-  └─ 读取商品的 receiving_quantity 作为默认值
-  └─ 存入 recv_cart session 数组
+  └─ 读取商品的 receiving_quantity 作为默认值（ITEM_TEMP=0）
+  ├─ receiving_quantity_choices = [1 => 'x1']  ← 前端下拉只有 x1
+  ├─ cart.receiving_quantity = 0               ← 后端实际存 0
+  ├─ cart.total = get_item_total(qty, price, 0) = 0  ← ❌ 金额算出来为 0
+  └─ 存入 session cart
     ↓
-用户完成收货，点击提交
-    ↓
-Receivings::postComplete()
-  └─ Receiving_lib::get_cart() 获取购物车数据
-  └─ Receiving::save_value() 执行入库（事务内）
-      ├─ 插入 receivings_items: receiving_quantity 原样存入
-      ├─ items_received = receiving_quantity!=0 ? qty*rq : qty
-      │   └─ ⚠️ ITEM_TEMP 因 rq=0 触发退化 → 实际入库 qty
-      ├─ 如果配置 receiving_calculate_average_price
-      │   └─ Item::change_cost_price() → 重算成本价
-      ├─ item_quantities += items_received
-      │   └─ ❌ 无 stock_type 检查，HAS_NO_STOCK 也增加
-      ├─ inventory: trans_inventory = items_received
-      │   └─ ❌ 无判断，即使 items_received=0 也插入
-      └─ attribute copy_attribute_links
+用户直接提交（不编辑）           ↔            用户先 edit_item（编辑任何字段）
+    ↓  rq=0 保留在 cart                     ↓  form_dropdown POST rq=1 覆盖 cart
+    ↓                                            ↓
+Receiving::save_value() 执行入库（事务内）
+  ├─ 插入 receivings_items: receiving_quantity 原样存入（0 或 1）
+  ├─ items_received = rq!=0 ? qty*rq : qty
+  │   └─ ⚠️ rq=0 时退化 → 实际入库 qty（与 cart.total=0 金额不一致）
+  ├─ 如果配置 receiving_calculate_average_price
+  │   └─ Item::change_cost_price() → 重算成本价
+  ├─ item_quantities += items_received
+  │   └─ ❌ 无 stock_type 检查，HAS_NO_STOCK 也增加
+  ├─ inventory: trans_inventory = items_received
+  │   └─ ❌ 无判断，即使 items_received=0 也插入
+  └─ attribute copy_attribute_links
     ↓
 删除该收货单
     ↓
@@ -1019,27 +1057,7 @@ Receiving::delete_value()（事务内）
       └─ ⚠️ rq=0 时 =0，库存没被回滚 → 幽灵库存产生
 ```
 
-### 8.1 收货完整链路（含 receiving_quantity）
-
-```
-用户添加商品到收货车
-    ↓
-Receiving_lib::add_item()
-  └─ 读取商品的 receiving_quantity 作为默认值（可修改）
-  └─ 存入 recv_cart session 数组
-    ↓
-用户完成收货，点击提交
-    ↓
-Receivings::postComplete()
-  └─ Receiving_lib::get_cart() 获取购物车数据
-  └─ Receiving::save_value() 执行入库
-      ├─ items_received = quantity × receiving_quantity
-      ├─ 更新 item_quantities += items_received
-      ├─ 插入 inventory 流水: trans_inventory = items_received
-      └─ 写入 receivings / receivings_items 表
-```
-
-### 8.2 商品创建/编辑链路
+### 9.2 商品创建/编辑链路
 
 ```
 postSave()
