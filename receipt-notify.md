@@ -98,7 +98,65 @@ OSPOS 系统的收据通知功能目前仅支持**邮件**发送，**短信**功
 
 ---
 
-### 2. 前置条件检查
+### 2. email_receipt 生命周期：结账后是否影响下一单
+
+**核心结论**：默认 `last` 模式下，勾选状态**不会延续到下一单**。
+
+#### 时序分析
+
+```
+第一单 - 收银台页面
+  ① 用户勾选"邮件收据"
+      → AJAX POST /sales/setEmailReceipt
+      → Sale_lib::set_email_receipt()
+      → Session: sales_email_receipt = 'true' / '1'
+
+  ② 点击"完成"按钮
+      → Sales::postComplete() 入口
+      → L724 读取 $data['email_receipt'] = is_email_receipt()  // 值为 true，存入视图变量
+      → L816/L854/L882/L900 调用 sale->save_value() 保存销售单到数据库
+      → L827/L861/L888/L919 调用 sale_lib->clear_all()
+            ↓
+            Sale_lib::clear_all() [L1413-L1429]
+              → L1420: $this->clear_email_receipt()
+              → Session 删除 sales_email_receipt 键
+      → 返回 receipt.php/invoice.php 视图（视图中的 $email_receipt 仍是 true）
+
+  ③ 收据页面 JS
+      → 判断 $email_receipt == true
+      → 自动触发发送邮件 AJAX（正常执行）
+
+用户点击"回到收银台" → 开始第二单
+  ④ Sales::getIndex() → _reload()
+      → L1248: $data['email_receipt'] = is_email_receipt()
+            ↓
+            is_email_receipt() [L546-L556]
+              → email_receipt_check_behaviour == 'last'
+              → 检查 Session sales_email_receipt
+              → 键已不存在 → 返回 false
+      → 收银台页面复选框为【未勾选状态】
+```
+
+#### 三种配置模式下的表现对比
+
+| 配置值 | 下一单默认状态 | 原因 |
+|---|---|---|
+| `always` | 始终勾选 | 直接返回 true，不依赖 Session |
+| `never` | 始终不勾选 | 直接返回 false，不依赖 Session |
+| `last`（默认） | **不勾选** | `clear_all()` 清除了 Session，记忆丢失 |
+
+#### 关键代码位置
+
+- 清除操作：[Sale_lib::clear_all()](file:///d:/fz/0601-1/solo-dogfeeding/code/19-opensourcepos/app/Libraries/Sale_lib.php#L1413-L1429) 第 L1420 行
+- 读取判断：[Sale_lib::is_email_receipt()](file:///d:/fz/0601-1/solo-dogfeeding/code/19-opensourcepos/app/Libraries/Sale_lib.php#L546-L556)
+
+#### 注意
+
+`last` 模式代码注释写的是 "Remember last setting, session based though"，但由于 `clear_all()` 在销售完成时无条件清除 Session，实际上它**只在同一单的多次操作之间**（如添加/删除商品）保持记忆，**不会跨单记忆**。这是实现上与注释描述的细微偏差。
+
+---
+
+### 3. 前置条件检查
 
 发送邮件前必须满足以下条件：
 
