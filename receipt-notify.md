@@ -334,7 +334,7 @@ OSPOS 系统的收据通知功能目前仅支持**邮件**发送，**短信**功
 
 ## 六、关键代码路径总览
 
-### 邮件收据发送（自动发送路径）
+### 路径 1：邮件收据自动发送（结账后）
 
 ```
 收银台页面 (register.php)
@@ -346,36 +346,111 @@ OSPOS 系统的收据通知功能目前仅支持**邮件**发送，**短信**功
   → POST /sales/complete
     → Sales::postComplete()
       → 保存销售单到数据库（状态 COMPLETED）
-      → 返回 receipt.php 视图
+      → 返回 receipt.php / invoice.php 等视图
 
-收据页面加载 (receipt.php)
+收据页面加载
   → 检测到 email_receipt = true 且有 customer_email
-    → AJAX GET /sales/sendPdf/{id}/receipt
+    → AJAX GET /sales/sendPdf/{id}/{type}
       → Sales::getSendPdf()
-        → _load_sale_data() 构建数据
+        → _load_sale_data()：
+            - clear_all()              ← 第 1 次清空
+            - 从数据库回填销售数据
         → 生成 PDF
         → Email_lib::sendEmail() 发送
-          → 返回成功/失败
-            → 前端显示通知
-```
-
-### 邮件收据手动发送路径
-
-```
-销售详情页 / 收据页面
-  → 点击"邮件发送"按钮
-    → AJAX GET /sales/sendReceipt/{id}
-      → Sales::getSendReceipt()
-        → _load_sale_data() 构建数据
-        → 渲染 receipt_email.php 模板
-        → Email_lib::sendEmail() 发送
-          → 返回成功/失败
+        → clear_all()                ← 第 2 次清空（无论成功/失败）
+          → 返回 JSON {success, message}
             → 前端显示通知
 ```
 
 ---
 
-## 七、业务依赖总结
+### 路径 2：邮件收据手动发送（6 个触发点）
+
+**发送接口统一为 getSendPdf，getSendReceipt 是死代码（前端无调用）。**
+
+#### 2.1 单据页面手动按钮（5 种单据）
+
+```
+收据/发票/税务发票/报价单/工单 页面
+  → 用户点击"发送邮件"按钮
+    → AJAX GET /sales/sendPdf/{sale_id}/{type}
+      → Sales::getSendPdf()
+        → _load_sale_data()
+        → 生成 PDF
+        → Email_lib::sendEmail() 发送
+        → clear_all()
+          → 返回 JSON
+            → 前端显示通知
+```
+
+#### 2.2 销售编辑弹窗手动发送
+
+```
+销售详情/编辑弹窗 (form.php)
+  → 用户点击"发送发票"按钮
+    → 弹出确认框
+    → 确认后 AJAX GET /sales/sendPdf/{sale_id}
+      → Sales::getSendPdf()
+        → _load_sale_data()
+        → 生成 PDF
+        → Email_lib::sendEmail() 发送
+        → clear_all()
+          → 返回 JSON
+            → 关闭弹窗 + 前端显示通知
+```
+
+---
+
+### 路径 3：查看历史收据/发票（有副作用）
+
+```
+销售编辑弹窗 (form.php)
+  → 用户点击"POS 12345"链接
+    → 新标签页打开 GET /sales/receipt/{sale_id}
+      → Sales::getReceipt()
+        → _load_sale_data($sale_id)
+            - clear_all()              ← 第 1 次清空（清空当前编辑的销售会话）
+            - copy_entire_sale() 从数据库回填历史单据
+        → clear_all()                ← 第 2 次清空（渲染完毕清理）
+          → 返回 HTML 收据页面
+
+【副作用】：如果另一个标签页正在编辑新销售，购物车等数据会被清空。
+```
+
+**同理适用于查看历史发票**：`GET /sales/invoice/{sale_id}` → `Sales::getInvoice()`
+
+---
+
+### 路径 4：getSendReceipt（死代码，无前端调用）
+
+```
+（无前端入口）
+手动访问 GET /sales/sendReceipt/{sale_id}
+  → Sales::getSendReceipt()
+    → _load_sale_data()
+    → 渲染 receipt_email.php 模板（无 PDF，直接 HTML 正文）
+    → Email_lib::sendEmail() 发送
+    → clear_all()
+      → 返回 JSON
+```
+
+---
+
+## 七、clear_all() 调用次数汇总
+
+| 操作路径 | 调用次数 | 位置 |
+|---|---|---|
+| 完成销售（postComplete） | 1 | 保存成功后 |
+| 发送邮件（getSendPdf） | 2 | _load_sale_data 内部 + 方法末尾 |
+| 发送邮件（getSendReceipt） | 2 | _load_sale_data 内部 + 方法末尾 |
+| 查看历史收据（getReceipt） | 2 | _load_sale_data 内部 + 方法末尾 |
+| 查看历史发票（getInvoice） | 2 | _load_sale_data 内部 + 方法末尾 |
+
+**一次完整结账+自动发邮件累计调用 3 次 clear_all()**
+
+---
+
+## 八、业务依赖总结
 
 | 依赖项 | 类型 | 说明 |
 |---|---|---|
@@ -397,7 +472,10 @@ OSPOS 系统的收据通知功能目前仅支持**邮件**发送，**短信**功
 4. **短信能力缺失**：目前没有短信收据功能，短信模块是独立的通用消息模块，与收据流程无集成
 5. **无重试机制**：发送失败后需要用户手动点击按钮重试，没有自动重试队列
 6. **无审计日志**：邮件发送没有专门的审计日志表，仅在失败时记录通用错误日志
-7. **last 模式跨单记忆偏差**：`email_receipt_check_behaviour=last` 配置注释写"记住上次"，但 `clear_all()` 在销售完成时清空 Session，实际**不会跨单记忆**，仅在同一单多次操作间有效
-8. **多标签页会话冲突**：两个标签页共享 Session，一个标签页的发送邮件操作（内部 clear_all）可能清空另一个标签页正在编辑的销售内容
-9. **展示与发送数据源不一致**：页面展示的是结账时的临时内存数据，邮件里的是数据库回填的数据，虽然正常情况下一致，但存在理论上的不一致窗口
-10. **clear_all() 过度调用**：完成一次结账+发送邮件，会连续调用 3 次 `clear_all()`，虽然结果正确但略显冗余
+7. **getSendReceipt 是死代码**：后端定义了 `getSendReceipt()` 方法，但前端没有任何代码调用它。实际所有发送都走 `getSendPdf()`
+8. **last 模式跨单记忆偏差**：`email_receipt_check_behaviour=last` 配置注释写"记住上次"，但 `clear_all()` 在销售完成时清空 Session，实际**不会跨单记忆**，仅在同一单多次操作间有效
+9. **多标签页会话冲突（发送邮件）**：两个标签页共享 Session，一个标签页的发送邮件操作（内部 clear_all）可能清空另一个标签页正在编辑的销售内容
+10. **多标签页会话冲突（查看历史单据）**：在新标签页查看历史收据/发票（`getReceipt` / `getInvoice`）会调用 `_load_sale_data()` 和 `clear_all()`，清空当前正在编辑的购物车
+11. **展示与发送数据源不一致**：页面展示的是结账时的临时内存数据，邮件里的是数据库回填的数据，虽然正常情况下一致，但存在理论上的不一致窗口
+12. **clear_all() 过度调用**：完成一次结账+发送邮件，会连续调用 3 次 `clear_all()`；查看一次历史收据也会调用 2 次 `clear_all()`，虽然结果正确但略显冗余
+13. **查看历史单据的副作用被低估**：`getReceipt()` / `getInvoice()` 方法名看起来是"只读"操作，但实际上有修改 Session 的副作用，违反了直觉预期
