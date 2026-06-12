@@ -1,741 +1,582 @@
-# OSPOS 报表路由匹配规则与参数绑定机制分析（基于 CI4 实际行为）
+# OSPOS 报表路由三层关系分析：占位符 → 反向引用 → 方法实参
 
-本文档深入解析 OSPOS 报表系统的路由匹配规则、`(:any)` 任意段占位符的行为、多段参数开关的影响，以及三条核心路径（通用汇总、折扣报表、仅按日期统计）的实际命中过程与参数流转。
+本文档聚焦于 OSPOS 报表路由中最容易混淆的三层关系：
+1. **占位符捕获值**：`(:any)` 等占位符从 URL 中捕获了哪些片段
+2. **反向引用**：`$1/$2/$3/$4` 如何使用这些捕获值
+3. **方法实参**：最终传入控制器方法的参数列表，以及它们与 URL 段的对应关系
 
----
-
-## 一、框架级关键配置
-
-所有分析基于 OSPOS 在 [Routing.php](file:///d:/fz/0601-1/solo-dogfeeding/code/16-opensourcepos/app/Config/Routing.php) 中的实际配置：
-
-| 配置项 | 值 | 影响 |
-|--------|----|------|
-| `$autoRoute` (L97) | `true` | 未命中定义路由时，按 `段1/段2(方法)/段3(参数1)/段4(参数2)/...` 模式自动路由 |
-| `$multipleSegmentsOneParam` (L123) | **`false`** | `(:any)` 捕获的多段值（含 `/`）会被**按 `/` 再分割**成多个参数传递 |
-| `$prioritize` (L115) | `false` | 路由按**定义顺序**从上到下匹配，不按优先级排序 |
-| `$defaultController` (L51) | `Login` | 无匹配时的默认控制器 |
-| `$defaultMethod` (L60) | `index` | 方法缺失时的默认方法 |
-
-### 1.1 `$multipleSegmentsOneParam = false` 的核心影响
-
-**这是决定本系统路由行为的最关键开关。**
-
-| 配置值 | `(:any)` 含 `/` 时的参数传递 |
-|--------|----------------------------|
-| `true`（CI4.5+ 默认） | `(:any)` 捕获的 `a/b/c` 作为**单个整体参数**传递 → `method("a/b/c")` |
-| **`false`（OSPOS 当前配置）** | `(:any)` 捕获的 `a/b/c` **按 `/` 再分割**成多个参数 → `method("a", "b", "c")` |
-
-OSPOS 当前使用 `false`，所以**任何包含 `/` 的占位符捕获值都会导致参数数量不可预测地增加**。
-
-### 1.2 `(:any)` 占位符的段数匹配行为
-
-根据 CodeIgniter 4 官方文档，`(:any)` 的行为取决于它在路由模式中的位置：
-
-| `(:any)` 的位置 | 匹配行为 |
-|-----------------|---------|
-| **在路由末尾**（后面没有字面段或其他占位符） | 可以匹配**从该位置到 URL 末尾的所有字符**，包括 `/`，即**跨越多个段** |
-| **在路由中间**（后面有字面段或其他占位符） | 只能匹配**单个段**（不含 `/`），因为后面还有内容需要匹配 |
-
-**⚠️ 官方警告：不要在 `(:any)` 后面放置任何占位符！** 因为 `(:any)` 在末尾时匹配的段数不确定，会导致参数数量变化。
+特别区分：哪些捕获值**只参与路由匹配**（用完即弃），哪些会**继续传参**给方法。
 
 ---
 
-## 二、Routes.php 中每条报表路由的逐条分析
+## 一、框架基础：三层关系总览
 
-路由定义在 [Routes.php](file:///d:/fz/0601-1/solo-dogfeeding/code/16-opensourcepos/app/Config/Routes.php#L18-L42)，按定义顺序（匹配优先级）从上到下分析：
+### 1.1 配置前提（[Routing.php](file:///d:/fz/0601-1/solo-dogfeeding/code/16-opensourcepos/app/Config/Routing.php)）
 
-### 路由 #1：`reports/summary_(:any)/(:any)/(:any)` （L18）
+| 配置项 | 值 | 对三层关系的影响 |
+|--------|----|----------------|
+| `$multipleSegmentsOneParam` (L123) | **`false`** | 反向引用中的值若包含 `/`，会被**再分割**成多个实参 |
+| `$autoRoute` (L97) | `true` | 全部路由未命中时才启用，在当前报表体系中几乎不触发 |
+| `$prioritize` (L115) | `false` | 路由按**定义顺序**从上到下匹配 |
+
+### 1.2 `(:any)` 占位符的行为规则
+
+| `(:any)` 在路由中的位置 | 是否能跨段（含 `/`） | 说明 |
+|--------------------------|---------------------|------|
+| **中间**（后面还有字面/占位符） | ❌ 只能匹配单段 | 因为后续还需要匹配内容 |
+| **末尾**（后面无内容） | ✅ 可以匹配任意多段 | 从该位置到 URL 末尾全部捕获 |
+
+### 1.3 三层关系的通用数据流
+
+```
+URL 字符串
+    │
+    │  按 / 分割成：[段1, 段2, 段3, 段4, ...]
+    ▼
+┌─────────────────────────────────────┐
+│  第 1 层：占位符捕获（路由匹配阶段）  │
+│  路由模式中每个 (:any) 对应一个捕获组 │
+│  捕获值 = $1, $2, $3, ...            │
+└───────────────┬─────────────────────┘
+                │  所有捕获值都参与匹配（匹配不上就跳过该路由）
+                ▼
+┌─────────────────────────────────────┐
+│  第 2 层：反向引用替换（路由目标阶段）│
+│  路由目标中的 $1/$2/$3/$4 被替换为   │
+│  对应的捕获值。没有写 $N 的捕获值，   │
+│  在这一层被丢弃！                     │
+└───────────────┬─────────────────────┘
+                │  路由目标变为：控制器名::方法名/值1/值2/值3/...
+                ▼
+┌─────────────────────────────────────┐
+│  第 3 层：方法实参转换（调用阶段）    │
+│  1. 去掉 "控制器::方法名/" 前缀       │
+│  2. 剩余部分按 / 分割成数组           │
+│  3. ($multipleSegmentsOneParam=false)│
+│     每个反向引用值内部的 / 也会导致    │
+│     额外分割！                        │
+│  4. 按顺序绑定到方法形参              │
+│  5. 多余参数被 PHP 截断忽略           │
+└─────────────────────────────────────┘
+```
+
+**关键原则：捕获值 ≠ 实参。**
+- 捕获值要成为实参，必须满足：
+  1. 在路由目标中被显式写成 `$N`（通过反向引用阶段）
+  2. 经过分割规则后（反向引用值再按 `/` 分割）
+- 没有被反向引用使用的捕获值，在第 2 层被**丢弃**。
+
+---
+
+## 二、路由 #1 三层关系详解（所有 summary_* 带参请求的总入口）
+
+路由定义在 [Routes.php L18](file:///d:/fz/0601-1/solo-dogfeeding/code/16-opensourcepos/app/Config/Routes.php#L18)：
 
 ```php
 $routes->add('reports/summary_(:any)/(:any)/(:any)', 'Reports::Summary_$1/$2/$3/$4');
+//        ↑ 路由模式（左）                                    ↑ 路由目标（右）
 ```
 
-| 项目 | 分析 |
-|------|------|
-| **按 `/` 分割单元** | `['reports', 'summary_(:any)', '(:any)', '(:any)']` → 共 4 个单元 |
-| **单元 1** | `reports`（字面量，匹配段 1） |
-| **单元 2** | `summary_(:any)`（字面+第 1 个占位符，后面还有 2 个单元 → **只能匹配单个段**，匹配段 2 中 `_` 后的部分） |
-| **单元 3** | `(:any)`（第 2 个占位符，后面还有 1 个单元 → **只能匹配单个段**，匹配段 3） |
-| **单元 4** | `(:any)`（第 3 个占位符，**在路由末尾！可以匹配 1 个或多个段**，匹配段 4 到 URL 末尾的所有段） |
-| **匹配的 URL 段数** | **4 段或更多**（单元 1+2+3 各占 1 段 + 单元 4 占 1~N 段） |
-| **动态方法名** | `Summary_$1`，其中 `$1` = 单元 2 中 `summary_` 后的部分 |
-| **反向引用** | `$1/$2/$3/$4` → **有 3 个占位符但有 4 个反向引用！`$4` 悬空，永远是空串！** |
-| **参数传递（OSPOS 配置 `$multipleSegmentsOneParam=false`）** | 先替换 `$1~$4`，再按 `/` 分割整个参数部分，得到方法实参 |
+### 2.1 路由模式按 `/` 分割为 4 个单元
 
-#### 不同 URL 段数下的匹配与参数示例
+```
+路由模式分割：['reports', 'summary_(:any)', '(:any)', '(:any)']
+              ↑单元1    ↑单元2          ↑单元3    ↑单元4（末尾！）
+                字面量   占位符1($1)    占位符2   占位符3($3)
+                                    ($2)
+```
 
-URL 结构：`reports / summary_sales / 段3 / 段4 / 段5 / 段6 / 段7`
+各单元的属性：
 
-| 实际 URL | URL 段数 | 是否匹配路由 #1？ | `$1` | `$2` | `$3`（单元4，末尾） | `$4` | 目标路径 | 按 `/` 分割后的实参 |
-|---------|---------|------------------|------|------|-------------------|------|---------|-------------------|
-| `reports/summary_sales/a/b` | 4 | ✅ 匹配 | `sales` | `a` | `b`（1段） | `''` | `Summary_sales/a/b/` | `['a', 'b', '']`（3个） |
-| `reports/summary_sales/a/b/c` | 5 | ✅ 匹配 | `sales` | `a` | `b/c`（2段） | `''` | `Summary_sales/a/b/c/` | `['a', 'b', 'c', '']`（4个） |
-| `reports/summary_sales/a/b/c/d` | 6 | ✅ 匹配 | `sales` | `a` | `b/c/d`（3段） | `''` | `Summary_sales/a/b/c/d/` | `['a', 'b', 'c', 'd', '']`（5个） |
-| `reports/summary_sales/a/b/c/d/e` | 7 | ✅ 匹配 | `sales` | `a` | `b/c/d/e`（4段） | `''` | `Summary_sales/a/b/c/d/e/` | `['a', 'b', 'c', 'd', 'e', '']`（6个） |
+| 单元 | 内容 | 位置 | 是否为占位符 | 捕获编号 | 能否跨段 |
+|------|------|------|-------------|---------|---------|
+| 1 | `reports` | 第1 | 字面量（无捕获） | — | — |
+| 2 | `summary_(:any)` | 第2 | 部分占位符，`_` 后有 `(:any)` | `$1` | ❌ 后面还有单元 |
+| 3 | `(:any)` | 第3（倒数第二） | 全占位符 | `$2` | ❌ 后面还有单元 |
+| 4 | `(:any)` | 第4（末尾！） | 全占位符 | `$3` | ✅ 可以跨任意多段 |
 
-**关键发现：7 段 URL（前端实际生成的带参 URL）确实会命中路由 #1，而不是走自动路由！**
+### 2.2 以 7 段 URL 为例的三层流转全过程
+
+**通用汇总带参请求：** `reports/summary_sales/2024-01-01/2024-12-31/complete/all/0`（共 7 段）
+
+```
+URL 段：[1:reports, 2:summary_sales, 3:2024-01-01, 4:2024-12-31, 5:complete, 6:all, 7:0]
+```
+
+#### 第 1 层：占位符捕获（匹配阶段）
+
+```
+单元1 "reports"    ← 匹配 →  URL 段 1 "reports"       ✅（字面量相等，无捕获）
+单元2 "summary_(:any)"     →  匹配段 2 "summary_sales" ✅
+                              _ 后的部分作为 $1 捕获
+单元3 "(:any)"     ← 匹配 →  URL 段 3 "2024-01-01"    ✅（作为 $2 捕获）
+单元4 "(:any)"     ← 末尾，跨段匹配 →  段4+段5+段6+段7 = "2024-12-31/complete/all/0" ✅（作为 $3 捕获）
+```
+
+**第 1 层产出：三个捕获值**
+
+| 捕获编号 | 值 | 来自 URL 的哪些段 | 是否真的需要这个值 |
+|---------|----|------------------|------------------|
+| `$1` | `"sales"` | 段 2，`summary_` 之后的部分 | 用于拼动态方法名 `Summary_sales` |
+| `$2` | `"2024-01-01"` | 段 3 | 作为 $start_date |
+| `$3` | `"2024-12-31/complete/all/0"` | 段 4 + 段 5 + 段 6 + 段 7 | 作为 $end_date / $sale_type / $location_id / $discount_type |
 
 ---
 
-### 路由 #2：`reports/summary_expenses_categories` （L19）
+#### 第 2 层：反向引用替换（路由目标阶段）
+
+路由目标：`Reports::Summary_$1/$2/$3/$4`
+
+```
+替换 $1 → "sales"      → Summary_sales  （方法名部分）
+替换 $2 → "2024-01-01" → 第 1 个反斜杠后的值
+替换 $3 → "2024-12-31/complete/all/0" → 第 2 个反斜杠后的值（注意：内部还有 /）
+替换 $4 → ""（悬空，无对应占位符！）→ 第 3 个反斜杠后的值是空字符串
+```
+
+**第 2 层产出：替换后的完整路由目标字符串**
+
+```
+Reports::Summary_sales/2024-01-01/2024-12-31/complete/all/0/
+                                         ↑$2      ↑$3内部的 / 继续分割       ↑$4→空串导致末尾多一个 /
+```
+
+**⚠️ 关键区分：哪些捕获值只参与匹配，哪些会传参？**
+
+| 捕获编号 | 只参与匹配？还是传参？ | 原因 |
+|---------|------------------------|------|
+| `$1` | **两者都参与** | 1. 匹配阶段：必须等于 `summary_` 后的值，否则路由不命中<br>2. 反向引用阶段：拼到方法名 `Summary_$1`，但**不作为实参**（方法名不是参数） |
+| `$2` | **两者都参与** | 1. 匹配阶段：必须有这个段（存在性）<br>2. 反向引用阶段：`/$2` 成为实参来源的一部分 |
+| `$3` | **两者都参与** | 1. 匹配阶段：必须有 1 个或多个段（存在性）<br>2. 反向引用阶段：`/$3` 成为实参来源的主要部分 |
+| `$4` | **不存在** | 路由模式中根本没有第 4 个占位符，`$4` 是硬写在路由目标里的，永远为空串 |
+
+**结论：`$1`（"sales"、"discounts" 等）虽然被捕获，但它只用于决定调用哪个方法，不作为实参传入方法。**
+
+---
+
+#### 第 3 层：方法实参转换（调用阶段）
+
+从 `Reports::Summary_sales/2024-01-01/2024-12-31/complete/all/0/` 中：
+
+**步骤 1：去掉控制器::方法名前缀**
+
+```
+"Summary_sales/" 后面的部分 = "2024-01-01/2024-12-31/complete/all/0/"
+```
+
+**步骤 2：按 `/` 分割（因为 `$multipleSegmentsOneParam=false`）**
+
+```
+分割结果 = ["2024-01-01", "2024-12-31", "complete", "all", "0", ""]
+索引:        [0]          [1]           [2]        [3]     [4]  [5]
+来源:        $2         $3的第1段     $3的第2段  $3的第3段 $3的第4段 $4悬空
+```
+
+**步骤 3：按顺序绑定到方法形参**
+
+方法签名（[Reports.php L131](file:///d:/fz/0601-1/solo-dogfeeding/code/16-opensourcepos/app/Controllers/Reports.php#L131)）：
+```php
+public function summary_sales(
+    string $start_date,    // 形参 1
+    string $end_date,      // 形参 2
+    string $sale_type,     // 形参 3
+    string $location_id = 'all'  // 形参 4（有默认值）
+): string
+```
+
+绑定结果：
+
+| 实参索引 | 实参值 | 绑定到形参 | 对应 URL 原始段 | 状态 |
+|---------|--------|-----------|----------------|------|
+| [0] | `"2024-01-01"` | `$start_date` | 段 3 ✅ | 正确 |
+| [1] | `"2024-12-31"` | `$end_date` | 段 4 ✅ | 正确 |
+| [2] | `"complete"` | `$sale_type` | 段 5 ✅ | 正确 |
+| [3] | `"all"` | `$location_id` | 段 6 ✅ | 正确 |
+| [4] | `"0"` | （PHP 截断，无此形参） | 段 7（discount_type） | 丢弃 |
+| [5] | `""` | （PHP 截断，无此形参） | $4 悬空空串 | 丢弃 |
+
+**最终绑定效果：6 个实参 → 4 个形参，多余 2 个被 PHP 静默忽略。**
+
+### 2.3 路由 #1 的三层关系总图
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│ 第 1 层：占位符捕获（路由 #1 匹配 summary_sales/... 7 段 URL）                          │
+│                                                                                     │
+│  URL 段:  reports / summary_sales / 2024-01-01 / 2024-12-31 / complete / all / 0      │
+│            │         │              │            │          │        │      │         │
+│            ▼         ▼              ▼            ▼          ▼        ▼      ▼         │
+│         字面匹配    $1="sales"    $2="2024-01-01"        $3="2024-12-31/complete/all/0"  │
+│                     (只拼方法名)   (实参来源1)             (末尾跨段,实参来源2345)         │
+└──────────────────────────────────────────────┬──────────────────────────────────────────┘
+                                               │
+                                               ▼
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│ 第 2 层：反向引用替换                                                                │
+│                                                                                     │
+│  路由目标: Reports::Summary_$1 / $2 / $3 / $4                                        │
+│                              │       │       │    │                                   │
+│                              ▼       ▼       ▼    ▼                                   │
+│                    Summary_sales  2024-01-01  2024-12-31/complete/all/0  ""            │
+│                                                              │                                 │
+│  拼接后: Reports::Summary_sales/2024-01-01/2024-12-31/complete/all/0/                    │
+│                                                              │                                 │
+│  ⚠️ $1 拼到方法名，不是参数；$4 悬空无来源                                                │
+└──────────────────────────────────────────────┬──────────────────────────────────────────┘
+                                               │
+                                               ▼
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│ 第 3 层：方法实参转换（$multipleSegmentsOneParam=false，按 / 再分割）                     │
+│                                                                                     │
+│  方法名后按 / 分割:  [2024-01-01, 2024-12-31, complete, all, 0, ""]                    │
+│                       │           │          │       │     │     │                      │
+│                       ▼           ▼          ▼       ▼     ▼     ▼                      │
+│  方法形参:        $start_date $end_date $sale_type $loc_id  (多余) (多余)                  │
+│                  (形参1)    (形参2)   (形参3)   (形参4)  忽略   忽略                       │
+│                                                                                     │
+│  实参顺序与 URL 段顺序完全一致：段3→段4→段5→段6→段7 (→空串)                              │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 三、路径 A：通用汇总报表（summary_sales）完整命中分析
+
+### 3.1 场景 1：输入表单（2 段 URL = `reports/summary_sales`）
+
+**命中顺序（从上到下依次尝试）：**
+
+| 序号 | 尝试路由 | 模式 | 匹配结果 | 原因 |
+|------|---------|------|---------|------|
+| 1 | 路由 #1 L18 | `4段+` | ❌ 不匹配 | URL 只有 2 段，段数不足 |
+| 2 | 路由 #2 L19 | `summary_expenses_categories`（字面量） | ❌ 不匹配 | `summary_sales` ≠ 字面量值 |
+| 3 | 路由 #3 L20 | `summary_payments`（字面量） | ❌ 不匹配 | 字面量值不同 |
+| 4 | 路由 #4 L21 | `summary_discounts`（字面量） | ❌ 不匹配 | 字面量值不同 |
+| 5 | **路由 #5 L22** | `reports/summary_(:any)`（2段+，末尾） | ✅ **命中** | `summary_` 后段被 `(:any)` 捕获 |
+
+**路由 #5 三层关系：**
+
+```
+路由模式: reports/summary_(:any)
+路由目标: Reports::date_input （⚠️ 没有使用 $1！）
+
+第 1 层（占位符捕获）：
+  $1 = "sales"
+
+第 2 层（反向引用替换）：
+  ⚠️ 路由目标中没有写 $1！$1 的捕获值 "sales" 在这一层被丢弃！
+  替换后: Reports::date_input （无参数部分）
+
+第 3 层（方法实参转换）：
+  方法名后没有内容 → 0 个实参
+  调用：Reports::date_input() （无形参）
+```
+
+| 捕获值 | 是否只参与匹配 | 是否传参 |
+|--------|--------------|---------|
+| `$1 = "sales"` | ✅ 只参与匹配（用于通过路由） | ❌ 不传参（路由目标没写 `/$1`） |
+
+---
+
+### 3.2 场景 2：完整带参（7 段 URL）
+
+**命中顺序：**
+
+| 序号 | 尝试路由 | 匹配结果 | 原因 |
+|------|---------|---------|------|
+| 1 | **路由 #1 L18** | ✅ **命中** | 4段+模式，7段满足；末尾 `(:any)` 跨段匹配段4-7 |
+| 2-5 | 路由 #2/#3/#4/#5 | ⏭️ 跳过 | 路由 #1 已命中，不再尝试 |
+
+**三层关系详细结果（同 2.2 节）：**
+
+| 阶段 | 项目 | 值 | 来自哪里 |
+|------|------|----|---------|
+| 第1层 | $1 | `"sales"` | 段2 `summary_` 后 |
+| 第1层 | $2 | `"2024-01-01"` | 段3 |
+| 第1层 | $3 | `"2024-12-31/complete/all/0"` | 段4+段5+段6+段7 |
+| 第2层 | 方法名 | `Summary_sales` | `Summary_` + $1 |
+| 第2层 | 参数部分原始值 | `"2024-01-01/" + "2024-12-31/complete/all/0" + "/"` | `/$2/$3/$4` |
+| 第3层 | 实参数组 | `["2024-01-01", "2024-12-31", "complete", "all", "0", ""]` | 按 `/` 分割 |
+| 第3层 | 实参→形参绑定 | `start=段3, end=段4, type=段5, loc=段6` | 按顺序 |
+| 第3层 | 丢弃的参数 | `"0"`（段7）、`""`（$4悬空） | PHP 截断多余参数 |
+
+---
+
+### 3.3 场景 3：5 段 URL（缺少 location_id）
+
+命中路由：还是路由 #1
+
+三层关系关键差异：
+
+```
+第 1 层：$3 = "2024-12-31/complete"（只跨 2 段）
+第 3 层：实参数组 = ["2024-01-01", "2024-12-31", "complete", ""]
+                                                              ↑
+                                                              $location_id 收到 ""（空串）
+                                                              而非默认值 "all"！
+```
+
+⚠️ **Bug 场景：** 当 location_id 未显式传递时，`$4` 悬空导致末尾多了一个空串，刚好填满 4 个实参，`$location_id` 收到 `""` 而非默认值 `'all'`。
+
+---
+
+## 四、路径 B：折扣报表（summary_discounts + specific_discounts）
+
+### 4.1 B-1 汇总：summary_discounts 带参（7 段 URL）
+
+**命中顺序：**
+
+| 序号 | 尝试路由 | 匹配结果 | 原因 |
+|------|---------|---------|------|
+| 1 | **路由 #1 L18** | ✅ **命中** | `summary_discounts` 满足 `summary_xxx` 前缀模式 |
+
+**三层关系关键差异：**
+
+| 阶段 | 项目 | 值 | 对比 summary_sales |
+|------|------|----|-------------------|
+| 第1层 | $1 | `"discounts"`（不同！） | 之前是 `"sales"` |
+| 第2层 | 方法名 | `Summary_discounts`（不同！） | 之前是 `Summary_sales` |
+| 第3层 | 实参数组 | `["2024-01-01", "2024-12-31", "complete", "all", "0", ""]` | **完全相同！** |
+| 第3层 | 绑定形参（[Reports.php L555](file:///d:/fz/0601-1/solo-dogfeeding/code/16-opensourcepos/app/Controllers/Reports.php#L555)） | `start=段3, end=段4, type=段5, loc=段6, disc_type=段7`（有 5 个形参） | 之前是 4 个形参，段7之前被丢弃 |
+
+**折扣汇总的形参比通用汇总多 1 个，刚好接住段 7（discount_type），所以没有浪费！**
+
+### 4.2 B-2 明细：specific_discounts 带参（7 段 URL）
+
+路由：[Routes.php L38](file:///d:/fz/0601-1/solo-dogfeeding/code/16-opensourcepos/app/Config/Routes.php#L38) 路由 #17
 
 ```php
-$routes->add('reports/summary_expenses_categories', 'Reports::date_input_only');
+$routes->add('reports/specific_(:any)/(:any)/(:any)/(:any)', 'Reports::Specific_$1/$2/$3/$4');
+// 单元:  [1]    [2]               [3]    [4]    [5]（末尾！）
+// 捕获:        $1                $2     $3     $4
 ```
 
-| 项目 | 分析 |
-|------|------|
-| **按 `/` 分割单元** | `['reports', 'summary_expenses_categories']` → 2 个单元，全部字面量 |
-| **匹配的 URL 段数** | **精确等于 2 段**（无任何占位符，段数必须严格相等） |
-| **调用方法** | `Reports::date_input_only()` → 无参数 |
-| **优先级** | 定义在路由 #5（通配 `summary_(:any)`）之前，所以同是 2 段 URL 时优先命中 |
+URL：`reports/specific_discounts/2024-01-01/2024-12-31/10/complete/0`（7 段）
 
----
+```
+段: [1]reports [2]specific_discounts [3]2024-01-01 [4]2024-12-31 [5]10(discount值) [6]complete [7]0(折扣类型)
+```
 
-### 路由 #3：`reports/summary_payments` （L20）
+**命中顺序：**
 
+| 序号 | 尝试路由 | 匹配结果 | 原因 |
+|------|---------|---------|------|
+| 1-16 | 路由 #1~#16 | ❌ 不匹配 | 前缀是 `specific_` 不是 `summary_`/`graphical_`/`inventory_` 等 |
+| 17 | **路由 #17 L38** | ✅ **命中** | 5段+模式，7段满足 |
+
+**路由 #17 三层关系分析：**
+
+| 单元 | 内容 | 捕获编号 | 匹配的 URL 段 | 捕获值 |
+|------|------|---------|--------------|--------|
+| 1 | `reports` | — | 段 1 | （字面量，无捕获） |
+| 2 | `specific_(:any)` | `$1` | 段 2 `specific_discounts` | `"discounts"`（拼方法名，不传参） |
+| 3 | `(:any)` | `$2` | 段 3 | `"2024-01-01"`（start_date） |
+| 4 | `(:any)` | `$3` | 段 4 | `"2024-12-31"`（end_date） |
+| 5（末尾） | `(:any)` | `$4` | 段 5+段 6+段 7 | `"10/complete/0"`（3 段合并） |
+
+**第 2 层反向引用替换：**
+```
+路由目标: Reports::Specific_$1/$2/$3/$4
+替换后:  Reports::Specific_discounts/2024-01-01/2024-12-31/10/complete/0
+                                                        ↑$4 的 3 段被 / 分割成 3 个实参
+```
+
+**⚠️ 关键点：路由 #17 没有悬空的 `$5`！4 个占位符对应 4 个反向引用，全部正确。**
+
+**第 3 层方法实参转换：**
+
+方法签名（[Reports.php L1524](file:///d:/fz/0601-1/solo-dogfeeding/code/16-opensourcepos/app/Controllers/Reports.php#L1524)）：
 ```php
-$routes->add('reports/summary_payments', 'Reports::date_input_only');
+public function specific_discounts(
+    string $start_date,     // 形参 1
+    string $end_date,       // 形参 2
+    string $discount,       // 形参 3 ← ⚠️ 是折扣值！不是 sale_type
+    string $sale_type,      // 形参 4
+    string $discount_type   // 形参 5
+): string
 ```
 
-| 项目 | 分析 |
-|------|------|
-| **单元** | 2 个字面量单元 |
-| **匹配的 URL 段数** | 精确等于 2 段 |
-| **调用方法** | `Reports::date_input_only()` → 无参数 |
+绑定结果：
+
+| 实参值 | 绑定到 | 对应原始 URL 段 |
+|--------|-------|----------------|
+| `"2024-01-01"` | `$start_date` | 段 3 ✅ |
+| `"2024-12-31"` | `$end_date` | 段 4 ✅ |
+| `"10"` | `$discount` | 段 5 ✅（**折扣值**，不是销售类型！） |
+| `"complete"` | `$sale_type` | 段 6 ✅ |
+| `"0"` | `$discount_type` | 段 7 ✅ |
+
+**形参数 = 5，实参数 = 5，完美对应！无多余参数、无空串尾随。**
+（路由 #17 是所有报表路由中三层关系最正确的一个）
 
 ---
 
-### 路由 #4：`reports/summary_discounts` （L21）
+## 五、路径 C：仅按日期统计（summary_payments + summary_expenses_categories）
 
+### 5.1 C-1：summary_payments 带参（7 段 URL）
+
+URL：`reports/summary_payments/2024-01-01/2024-12-31/0/all/0`（7 段，段 5-7 是前端硬拼的假值）
+
+**命中顺序：依然是路由 #1！** `summary_payments` 满足 `summary_xxx` 前缀。
+
+**三层关系关键差异：**
+
+方法签名（[Reports.php L594](file:///d:/fz/0601-1/solo-dogfeeding/code/16-opensourcepos/app/Controllers/Reports.php#L594)）：
 ```php
-$routes->add('reports/summary_discounts', 'Reports::summary_discounts_input');
+public function summary_payments(
+    string $start_date,   // 形参 1
+    string $end_date      // 形参 2
+): string
 ```
 
-| 项目 | 分析 |
-|------|------|
-| **单元** | 2 个字面量单元 |
-| **匹配的 URL 段数** | 精确等于 2 段 |
-| **调用方法** | `Reports::summary_discounts_input()` → 注入了折扣类型下拉选项 |
+| 实参值 | 绑定到 | 对应原始 URL 段 | 说明 |
+|--------|-------|----------------|------|
+| `"2024-01-01"` | `$start_date` | 段 3 ✅ | 正确 |
+| `"2024-12-31"` | `$end_date` | 段 4 ✅ | 正确 |
+| `"0"` | PHP 截断丢弃 | 段 5（假值） | 形参只有 2 个，段5-7全丢弃 |
+| `"all"` | PHP 截断丢弃 | 段 6（假值） |  |
+| `"0"` | PHP 截断丢弃 | 段 7（假值） |  |
+| `""` | PHP 截断丢弃 | $4 悬空 |  |
+
+**捕获值 `$1 = "payments"` 只参与拼方法名，不传参。**
+**6 个实参 → 2 个形参，后 4 个（含假值）全部被 PHP 截断。**
+
+控制器层内部硬编码补偿（[Reports.php L598-L603](file:///d:/fz/0601-1/solo-dogfeeding/code/16-opensourcepos/app/Controllers/Reports.php#L598-L603)）：
+```php
+$inputs = [
+    'start_date'  => $start_date,  // ✅ 来自实参
+    'end_date'    => $end_date,    // ✅ 来自实参
+    'sale_type'   => 'complete',   // ⚠️ 硬编码，不是传参来的
+    'location_id' => 'all'         // ⚠️ 硬编码，不是传参来的
+];
+```
+
+### 5.2 C-2：summary_expenses_categories 带参（7 段 URL）
+
+**命中顺序：依然是路由 #1！** `summary_expenses_categories` 满足 `summary_xxx` 前缀。
+
+方法签名（[Reports.php L223](file:///d:/fz/0601-1/solo-dogfeeding/code/16-opensourcepos/app/Controllers/Reports.php#L223)）：
+```php
+public function summary_expenses_categories(
+    string $start_date,   // 形参 1
+    string $end_date,     // 形参 2
+    string $sale_type     // 形参 3
+): string
+```
+
+| 实参值 | 绑定到 | 对应原始 URL 段 | 说明 |
+|--------|-------|----------------|------|
+| `"2024-01-01"` | `$start_date` | 段 3 ✅ | 正确 |
+| `"2024-12-31"` | `$end_date` | 段 4 ✅ | 正确 |
+| `"0"` | `$sale_type` | 段 5（假值！） | ⚠️ 收到非法值 `"0"`，但模型层查询忽略此字段 |
+
+**6 个实参 → 3 个形参，第 3 个形参收到假值（但模型层不用它）。**
 
 ---
 
-### 路由 #5：`reports/summary_(:any)` （L22）
+## 六、只参与匹配 vs 实际传参：全清单
+
+### 6.1 路由 #1 中各捕获值的命运
+
+| 捕获编号 | 值内容 | 参与匹配（是/否） | 参与传参（是/否） | 具体方式 |
+|---------|--------|-------------------|------------------|---------|
+| **`$1`** | `"sales"` / `"discounts"` / `"payments"` / `"expenses_categories"` | ✅ 是（必须等于 `summary_` 后的值） | **方法名，非实参** | 拼到 `Summary_$1` 决定调用哪个方法，不是函数参数 |
+| **`$2`** | 段 3（通常是 start_date） | ✅ 是 | ✅ 是 | 通过 `/$2` 成为第 1 个实参来源 |
+| **`$3`** | 段 4 + 段 5 + ... + 段 N（末尾跨段） | ✅ 是 | ✅ 是 | 通过 `/$3` 成为后续多个实参来源（因为包含 `/`，会被再分割） |
+| **`$4`** | 不存在！悬空空串 | ❌ 不存在占位符 | ✅ 是（但值为空） | 通过 `/$4` 在末尾追加空串实参 |
+
+### 6.2 路由 #17 中各捕获值的命运（specific_discounts）
+
+| 捕获编号 | 值内容 | 参与匹配 | 参与传参 | 具体方式 |
+|---------|--------|---------|---------|---------|
+| **`$1`** | `"discounts"` / `"customers"` / `"employees"` / `"suppliers"` | ✅ 是 | **方法名，非实参** | 拼到 `Specific_$1` |
+| **`$2`** | 段 3（start_date） | ✅ 是 | ✅ 是 | 通过 `/$2` 成为实参 1 |
+| **`$3`** | 段 4（end_date） | ✅ 是 | ✅ 是 | 通过 `/$3` 成为实参 2 |
+| **`$4`** | 段 5+段6+段7（末尾跨段） | ✅ 是 | ✅ 是 | 通过 `/$4` 被再分割成实参 3/4/5 |
+| **`$5`（悬空）** | — | — | ❌ 没有 | 路由 #17 没有悬空的反向引用！ |
+
+### 6.3 路由 #5 中各捕获值的命运（输入表单通用路由）
 
 ```php
 $routes->add('reports/summary_(:any)', 'Reports::date_input');
 ```
 
-| 项目 | 分析 |
-|------|------|
-| **按 `/` 分割单元** | `['reports', 'summary_(:any)']` → 2 个单元 |
-| **单元 2** | `summary_(:any)`（第 1 个占位符，**在路由末尾！可以匹配 1 个或多个段**） |
-| **匹配的 URL 段数** | **2 段或更多**（但注意：2 段 URL 已被路由 #2/#3/#4 的字面量优先匹配了） |
-| **不使用 `$1`** | 路由目标中没有使用反向引用 `$1`，所以不管 `$1` 捕获了什么，都不会作为参数传递 |
-| **调用方法** | `Reports::date_input()`（固定方法，不根据 `$1` 动态变化） |
+| 捕获编号 | 值内容 | 参与匹配 | 参与传参 |
+|---------|--------|---------|---------|
+| **`$1`** | `"sales"` / `"items"` / ... | ✅ 是（通过 `summary_xxx` 字面检查） | **❌ 不传参！** 路由目标没有使用 `$1`，直接丢弃 |
 
-**重要：** 当 URL 是 3 段（如 `reports/summary_sales/foo`）时，路由 #5 也会匹配，因为末尾的 `(:any)` 可以跨越多个段，捕获 `sales/foo`。
+**这是唯一一个"捕获值完全丢弃"的路由。** `$1` 完全只是用来"通过匹配检查"，之后完全不用。
 
 ---
 
-### 路由 #6：`reports/graphical_(:any)/(:any)/(:any)` （L24）
+## 七、三条路径最终命中顺序和实参顺序对照表
 
-```php
-$routes->add('reports/graphical_(:any)/(:any)/(:any)', 'Reports::Graphical_$1/$2/$3/$4');
-```
+### 7.1 命中顺序对比表
 
-与路由 #1 结构完全相同，只是前缀变成了 `graphical_`：
+| 场景 | 路径 A 通用汇总（sales） | 路径 B-1 折扣汇总 | 路径 B-2 折扣明细 | 路径 C-1 仅日期（payments） | 路径 C-2 费用分类 |
+|------|------------------------|-----------------|-----------------|--------------------------|-----------------|
+| **输入表单（2段）** | ① #1(段数不够)×<br>② #2(字面不同)×<br>③ #3(字面不同)×<br>④ #4(字面不同)×<br>**⑤ #5 ✅** | ① #1×<br>② #2×<br>③ #3×<br>**④ #4 ✅** | ①-⑯ #1~#16 ×<br>⑰ #17(段数不够)×<br>⑱-⑲ ×<br>**⑳ #20 ✅** | ① #1×<br>② #2×<br>**③ #3 ✅** | ① #1×<br>**② #2 ✅** |
+| **带参数（7段）** | **① #1 ✅**（#1匹配，跳过其余） | **① #1 ✅**（summary_discounts 匹配前缀） | ①-⑯ ×<br>**⑰ #17 ✅** | **① #1 ✅**（summary_payments 匹配前缀） | **① #1 ✅**（summary_expenses_categories 匹配前缀） |
+| **命中的路由规则定义位置** | Routes.php L18 | Routes.php L18 | Routes.php L38 | Routes.php L18 | Routes.php L18 |
 
-| 项目 | 分析 |
-|------|------|
-| **末尾 `(:any)`** | 单元 4 在末尾，可以跨越段匹配 |
-| **匹配 URL 段数** | 4 段或更多 |
-| **`$4` 悬空** | 同样存在，永远是空串 |
+### 7.2 实参顺序对比表（带参数 7 段场景）
 
----
+URL 段顺序通用格式：`reports / 段2 / 段3 / 段4 / 段5 / 段6 / 段7`
 
-### 路由 #7：`reports/graphical_summary_expenses_categories` （L25）
+| 路径 | 方法形参 | 形参1 | 形参2 | 形参3 | 形参4 | 形参5 | 丢弃值 |
+|------|---------|-------|-------|-------|-------|-------|--------|
+| **A 通用汇总** | 4 个 | $start_date ← 段3 | $end_date ← 段4 | $sale_type ← 段5 | $location_id ← 段6 | — | 段7、$4空串 |
+| **B-1 折扣汇总** | 5 个 | $start_date ← 段3 | $end_date ← 段4 | $sale_type ← 段5 | $location_id ← 段6 | $discount_type ← 段7 | $4空串 |
+| **B-2 折扣明细** | 5 个 | $start_date ← 段3 | $end_date ← 段4 | **$discount ← 段5**（折扣值） | $sale_type ← 段6 | $discount_type ← 段7 | 无（完美匹配） |
+| **C-1 仅日期** | 2 个 | $start_date ← 段3 | $end_date ← 段4 | — | — | — | 段5假值、段6假值、段7假值、$4空串（共4个丢弃） |
+| **C-2 费用分类** | 3 个 | $start_date ← 段3 | $end_date ← 段4 | $sale_type ← 段5⚠️收到假值"0" | — | — | 段6、段7、$4空串（共3个丢弃） |
 
-字面量路由，精确 2 段匹配 → `date_input_only()`
+### 7.3 路由 #1 形参数 vs 实参数对比（所有 summary_* 方法）
 
-### 路由 #8：`reports/graphical_summary_discounts` （L26）
-
-字面量路由，精确 2 段匹配 → `summary_discounts_input()`
-
-### 路由 #9：`reports/graphical_(:any)` （L27）
-
-末尾 `(:any)`，2 段或更多匹配 → `Reports::date_input()`（不使用 `$1`）
-
-### 路由 #10：`reports/inventory_(:any)/(:any)` （L29）
-
-```php
-$routes->add('reports/inventory_(:any)/(:any)', 'Reports::Inventory_$1/$2');
-```
-
-| 项目 | 分析 |
-|------|------|
-| **按 `/` 分割单元** | `['reports', 'inventory_(:any)', '(:any)']` → 3 个单元 |
-| **单元 2** | `inventory_(:any)`（后面还有 1 个单元 → 只能匹配单个段，段 2 中 `_` 后部分） |
-| **单元 3** | `(:any)`（**在路由末尾！可以匹配 1 个或多个段**） |
-| **匹配 URL 段数** | 3 段或更多 |
-| **反向引用** | `$1/$2`（2 个占位符对应 2 个引用，**无悬空问题**） |
+| 报表方法 | 所在行 | 形参数 | 7段 URL 实参数（6个） | 多余参数 | 是否有默认值参数被干扰 |
+|---------|--------|--------|---------------------|---------|----------------------|
+| `summary_sales` | L131 | 4 | 6 | 2个（段7、空串） | 否（段6显式传 `loc`） |
+| `summary_items` | L265 | 4 | 6 | 2个 | 否 |
+| `summary_categories` | L312 | 4 | 6 | 2个 | 否 |
+| `summary_customers` | L359 | 4 | 6 | 2个 | 否 |
+| `summary_suppliers` | L406 | 4 | 6 | 2个 | 否 |
+| `summary_employees` | L453 | 4 | 6 | 2个 | 否 |
+| `summary_taxes` | L500 | 4 | 6 | 2个 | 否 |
+| `summary_sales_taxes` | L580 | 4 | 6 | 2个 | 否 |
+| `summary_discounts` | L555 | 5 | 6 | 1个（仅空串） | 否（段7传 `disc_type`，刚好接住） |
+| `summary_payments` | L594 | 2 | 6 | 4个 | 否（内部硬编码补偿） |
+| `summary_expenses_categories` | L223 | 3 | 6 | 3个 | ⚠️ 形参3收到假值"0"（但模型忽略） |
 
 ---
 
-### 路由 #11：`reports/inventory_low` （L30）
+## 八、三层关系的常见误区澄清
 
-字面量路由，精确 2 段 → `inventory_low()`
+### 误区 1：`$1` 是第一个实参
 
-### 路由 #12：`reports/inventory_summary` （L31）
+❌ 错误。`$1` 在路由 #1 中用于拼动态方法名 `Summary_$1`，**不是方法实参**。第一个实参是 `$2` 的值。
 
-字面量路由，精确 2 段 → `inventory_summary_input()`
+✅ 正确的实参顺序：`$2` → 实参1，`$3` 被 `/` 分割 → 实参2、实参3、实参4...，`$4` 悬空 → 末尾空串
 
-### 路由 #13：`reports/inventory_summary/(:any)/(:any)/(:any)` （L32）
+### 误区 2：占位符编号 = 实参顺序编号
 
-```php
-$routes->add('reports/inventory_summary/(:any)/(:any)/(:any)', 'Reports::inventory_summary/$1/$2/$3');
-```
+❌ 错误。因为：
+1. `$1` 不用于传参（方法名不是参数）
+2. `$3`（末尾跨段）包含多个 `/`，在 `$multipleSegmentsOneParam=false` 时会被**再分割**成多个实参
+3. 可能存在悬空的反向引用（如 `$4`），凭空增加实参
 
-| 项目 | 分析 |
-|------|------|
-| **按 `/` 分割单元** | `['reports', 'inventory_summary', '(:any)', '(:any)', '(:any)']` → 5 个单元 |
-| **前两个单元** | 字面量（段 1、段 2） |
-| **单元 5** | `(:any)` 在末尾 → 可以跨越段 |
-| **匹配 URL 段数** | 5 段或更多 |
-| **反向引用** | 3 个占位符对应 3 个引用 → **无悬空问题** |
+### 误区 3：路由匹配成功 = 所有捕获值都会用到
 
----
+❌ 错误。典型反例是路由 #5 `reports/summary_(:any)` → `Reports::date_input`：
+- `$1` 捕获了 `"sales"`，但路由目标中没有使用 `$1`
+- 这个捕获值**只参与匹配**，用完即弃，不参与传参
 
-### 路由 #14：`reports/detailed_(:any)/(:any)/(:any)/(:any)` （L34）
+### 误区 4：URL 段 N 对应方法的第 N-2 个参数
 
-```php
-$routes->add('reports/detailed_(:any)/(:any)/(:any)/(:any)', 'Reports::Detailed_$1/$2/$3/$4');
-```
+✅ 对于带参数（7段）场景，这个结论**在路由 #1 和路由 #17 中恰好成立**：
+- 段 3 → 实参 1
+- 段 4 → 实参 2
+- 段 5 → 实参 3
+- 段 6 → 实参 4
+- 段 7 → 实参 5
 
-| 项目 | 分析 |
-|------|------|
-| **按 `/` 分割单元** | 5 个单元：`['reports', 'detailed_(:any)', '(:any)', '(:any)', '(:any)']` |
-| **单元 5** | `(:any)` 在末尾 → 可以跨越段 |
-| **匹配 URL 段数** | 5 段或更多 |
-| **反向引用** | 4 个占位符对应 4 个引用 → **无悬空问题**（和路由 #13 一样正确） |
-
----
-
-### 路由 #15：`reports/detailed_sales` （L35）
-
-字面量路由，精确 2 段 → `date_input_sales()`
-
-### 路由 #16：`reports/detailed_receivings` （L36）
-
-字面量路由，精确 2 段 → `date_input_recv()`
-
-### 路由 #17：`reports/specific_(:any)/(:any)/(:any)/(:any)` （L38）
-
-```php
-$routes->add('reports/specific_(:any)/(:any)/(:any)/(:any)', 'Reports::Specific_$1/$2/$3/$4');
-```
-
-结构与路由 #14 完全相同：
-- 5 个单元，末尾 `(:any)` 可以跨越段
-- 匹配 5 段或更多
-- 4 个占位符对应 4 个反向引用 → **无悬空问题**
-
-### 路由 #18-#21：`reports/specific_*` （L39-L42）
-
-4 条字面量路由，精确 2 段匹配：
-- `specific_customers` → `specific_customer_input()`
-- `specific_employees` → `specific_employee_input()`
-- `specific_discounts` → `specific_discount_input()`
-- `specific_suppliers` → `specific_supplier_input()`
-
----
-
-## 三、路由匹配优先级总表（按定义顺序）
-
-```
-高  ↓  1. reports/summary_(:any)/(:any)/(:any)        ← 4段+ 通配
-优  ↓  2. reports/summary_expenses_categories         ← 字面2段
-先  ↓  3. reports/summary_payments                    ← 字面2段
-级  ↓  4. reports/summary_discounts                   ← 字面2段
-    ↓  5. reports/summary_(:any)                      ← 2段+ 通配
-    ↓  6. reports/graphical_(:any)/(:any)/(:any)      ← 4段+ 通配
-    ↓  7. reports/graphical_summary_expenses_categories ← 字面2段
-    ↓  8. reports/graphical_summary_discounts         ← 字面2段
-    ↓  9. reports/graphical_(:any)                    ← 2段+ 通配
-    ↓ 10. reports/inventory_(:any)/(:any)             ← 3段+ 通配
-    ↓ 11. reports/inventory_low                       ← 字面2段
-    ↓ 12. reports/inventory_summary                   ← 字面2段
-    ↓ 13. reports/inventory_summary/(:any)/(:any)/(:any) ← 5段+ 通配
-    ↓ 14. reports/detailed_(:any)/(:any)/(:any)/(:any) ← 5段+ 通配
-    ↓ 15. reports/detailed_sales                      ← 字面2段
-    ↓ 16. reports/detailed_receivings                 ← 字面2段
-    ↓ 17. reports/specific_(:any)/(:any)/(:any)/(:any) ← 5段+ 通配
-低  ↓ 18-21. reports/specific_* 四条字面量             ← 字面2段
-```
-
----
-
-## 四、三条核心路径的完整匹配过程
-
-### 4.1 路径 A：通用汇总报表（以 `summary_sales` 为例）
-
-#### 场景 1：访问输入表单（2 段 URL）
-
-```
-URL: reports/summary_sales（2段）
-
-匹配过程（从上到下）：
-  1. 路由 #1: 需要 4段+ → ❌ 段数不够
-  2. 路由 #2: "summary_expenses_categories" ≠ "summary_sales" → ❌
-  3. 路由 #3: "summary_payments" ≠ "summary_sales" → ❌
-  4. 路由 #4: "summary_discounts" ≠ "summary_sales" → ❌
-  5. 路由 #5: reports/summary_(:any)（2段+） → ✅ 匹配！
-     $1 = "sales"
-     目标: Reports::date_input（不使用 $1）
-     调用: Reports::date_input()（无参数）
-
-结果：渲染日期选择表单（注入了销售类型和仓库下拉选项）
-```
-
-#### 场景 2：提交表单（7 段 URL，前端 JS 拼 5 个参数）
-
-```
-URL: reports/summary_sales/2024-01-01/2024-12-31/complete/all/0（7段）
-段:  1-reports  2-summary_sales  3-2024-01-01  4-2024-12-31  5-complete  6-all  7-0
-
-匹配过程（从上到下）：
-  1. 路由 #1: reports/summary_(:any)/(:any)/(:any)（4段+） → ✅ 匹配！
-     单元1 → 段1: reports
-     单元2 → 段2: summary_sales → $1 = "sales"
-     单元3 → 段3: 2024-01-01 → $2 = "2024-01-01"
-     单元4（末尾）→ 段4+段5+段6+段7: "2024-12-31/complete/all/0" → $3 = "2024-12-31/complete/all/0"
-     $4 = ""（悬空，无对应占位符）
-
-     替换目标: Reports::Summary_sales/2024-01-01/2024-12-31/complete/all/0/
-     参数部分（按 / 分割）: ["2024-01-01", "2024-12-31", "complete", "all", "0", ""]（6个参数）
-
-     方法签名: summary_sales($start_date, $end_date, $sale_type, $location_id = 'all')
-     参数绑定:
-       $start_date  = "2024-01-01"  ← ✅ 正确（段3）
-       $end_date    = "2024-12-31"  ← ✅ 正确（段4）
-       $sale_type   = "complete"    ← ✅ 正确（段5）
-       $location_id = "all"         ← ✅ 正确（段6）
-       多余参数 "0"（段7-discount_type）和 ""（悬空 $4）被 PHP 静默忽略！
-
-结果：通过路由 #1 命中 Summary_sales()，参数绑定完全正确！
-```
-
-#### 场景 3：5 段 URL（用户只选了 3 个参数，没有 location_id）
-
-```
-URL: reports/summary_sales/2024-01-01/2024-12-31/complete（5段）
-
-匹配：路由 #1 → ✅
-  $1 = "sales"
-  $2 = "2024-01-01"
-  $3 = "2024-12-31/complete"
-  $4 = ""
-  参数分割: ["2024-01-01", "2024-12-31", "complete", ""]（4个）
-  绑定:
-    $start_date  = "2024-01-01" ✅
-    $end_date    = "2024-12-31" ✅
-    $sale_type   = "complete"   ✅
-    $location_id = ""           ← ⚠️ 收到空串，而不是默认值 "all"！
-
-  ⚠️  BUG！当 location_id 未显式传递时，路由 #1 会传空串而非默认值。
-  但前端 JS 总是拼 5 个参数（含 location_id='all'），所以实际几乎不触发。
-```
-
-| 场景 | URL 段数 | 命中路由 | 调用方法 | 参数正确性 |
-|------|---------|---------|---------|-----------|
-| 输入表单 | 2 段 | #5 | `date_input()` | ✅ |
-| 完整参数 | 7 段 | **#1** | `Summary_sales(6个参数，末尾2个忽略)` | ✅ 完全正确 |
-| 缺 location_id | 5 段 | #1 | `Summary_sales(4个参数)` | ⚠️ $location_id 收到空串 |
-
----
-
-### 4.2 路径 B：折扣报表（`summary_discounts` 和 `specific_discounts`）
-
-#### 路径 B-1：`summary_discounts` 折扣汇总
-
-**场景 1：输入表单（2 段 URL）**
-
-```
-URL: reports/summary_discounts（2段）
-
-匹配：
-  1. 路由 #1: 4段+ → ❌
-  2-3. 字面量不匹配 → ❌
-  4. 路由 #4: "summary_discounts" 字面量精确匹配 → ✅
-  调用: Reports::summary_discounts_input()（注入了折扣类型下拉选项）
-```
-
-**场景 2：完整参数（7 段 URL）**
-
-```
-URL: reports/summary_discounts/2024-01-01/2024-12-31/complete/all/0（7段）
-
-匹配：
-  1. 路由 #1: reports/summary_(:any)/(:any)/(:any)（4段+） → ✅ 匹配！
-     （注意：summary_discounts 满足 summary_ 前缀模式！）
-     $1 = "discounts"
-     $2 = "2024-01-01"
-     $3 = "2024-12-31/complete/all/0"
-     $4 = ""
-     动态方法名: Summary_discounts
-     参数分割: ["2024-01-01", "2024-12-31", "complete", "all", "0", ""]（6个）
-
-  方法签名: summary_discounts($start_date, $end_date, $sale_type, $location_id='all', $discount_type=0)
-  绑定:
-    $start_date    = "2024-01-01"  ✅
-    $end_date      = "2024-12-31"  ✅
-    $sale_type     = "complete"    ✅
-    $location_id   = "all"         ✅
-    $discount_type = "0"           ✅
-    多余 "" 被忽略
-
-结果：通过路由 #1 命中 Summary_discounts()，参数完全正确！
-（路由 #4 的字面量只匹配 2 段，7 段 URL 不匹配 #4）
-```
-
-**关键发现：折扣汇总 `summary_discounts` 的带参请求实际上也命中了通用汇总路由 #1！** 因为 `summary_discounts` 满足 `summary_xxx` 的通用前缀模式。
-
-#### 路径 B-2：`specific_discounts` 折扣明细
-
-**场景 1：输入表单（2 段 URL）**
-
-```
-URL: reports/specific_discounts（2段）
-
-匹配：
-  1-16. 前面路由段数或字面量不匹配 → ❌
-  17. 路由 #17: 需要 5段+ → ❌ 段数不够
-  18-19. specific_customers/employees → ❌
-  20. 路由 #20: "specific_discounts" 字面量精确匹配 → ✅
-  调用: Reports::specific_discount_input()
-```
-
-**场景 2：完整参数（7 段 URL）**
-
-```
-URL: reports/specific_discounts/2024-01-01/2024-12-31/10/complete/0（7段）
-段:  1-reports  2-specific_discounts  3-2024-01-01  4-2024-12-31  5-10(discount值)  6-complete  7-0(折扣类型)
-
-匹配：
-  1-16. 前面路由前缀不匹配 → ❌
-  17. 路由 #17: reports/specific_(:any)/(:any)/(:any)/(:any)（5段+） → ✅ 匹配！
-      单元1 → 段1: reports
-      单元2 → 段2: specific_discounts → $1 = "discounts"
-      单元3 → 段3: 2024-01-01 → $2 = "2024-01-01"
-      单元4 → 段4: 2024-12-31 → $3 = "2024-12-31"
-      单元5（末尾）→ 段5+段6+段7: "10/complete/0" → $4 = "10/complete/0"
-
-      替换目标: Reports::Specific_discounts/2024-01-01/2024-12-31/10/complete/0
-      参数分割: ["2024-01-01", "2024-12-31", "10", "complete", "0"]（5个）
-
-      方法签名: specific_discounts($start_date, $end_date, $discount, $sale_type, $discount_type)
-      绑定:
-        $start_date    = "2024-01-01"  ✅（段3）
-        $end_date      = "2024-12-31"  ✅（段4）
-        $discount      = "10"          ✅（段5-折扣值！）
-        $sale_type     = "complete"    ✅（段6）
-        $discount_type = "0"           ✅（段7）
-      形参数=实参数，完全匹配！无多余参数！
-
-结果：通过路由 #17 命中 Specific_discounts()，参数完全正确！
-```
-
----
-
-### 4.3 路径 C：仅按日期统计（`summary_payments` 和 `summary_expenses_categories`）
-
-#### 路径 C-1：`summary_payments` 支付方式统计
-
-**场景 1：输入表单（2 段 URL）**
-
-```
-URL: reports/summary_payments（2段）
-
-匹配：
-  1. 路由 #1: 4段+ → ❌
-  2. summary_expenses_categories → ❌
-  3. 路由 #3: "summary_payments" 字面量精确匹配 → ✅
-  调用: Reports::date_input_only()（无注入 $mode/$stock_locations）
-        → 表单上没有销售类型/仓库下拉选项
-```
-
-**场景 2：提交表单（7 段 URL，前端 JS 硬拼 5 个参数）**
-
-```
-URL: reports/summary_payments/2024-01-01/2024-12-31/0/all/0（7段）
-段:  1-reports  2-summary_payments  3-2024-01-01  4-2024-12-31  5-0  6-all  7-0
-（注意：段5-7 是前端 JS 强行拼的假值，因为 date_input_only 没注入这些选项，所以值为 0/all/0）
-
-匹配：
-  1. 路由 #1: reports/summary_(:any)/(:any)/(:any)（4段+） → ✅ 匹配！
-     （summary_payments 满足 summary_ 前缀！）
-     $1 = "payments"
-     $2 = "2024-01-01"
-     $3 = "2024-12-31/0/all/0"
-     $4 = ""
-     动态方法名: Summary_payments
-     参数分割: ["2024-01-01", "2024-12-31", "0", "all", "0", ""]（6个参数）
-
-  方法签名: summary_payments($start_date, $end_date)（只有 2 个形参！）
-  绑定:
-    $start_date = "2024-01-01"  ✅（段3）
-    $end_date   = "2024-12-31"  ✅（段4）
-    多余参数 "0", "all", "0", "" 共 4 个被 PHP 静默忽略！
-
-结果：通过路由 #1 命中 Summary_payments()，前 2 个参数正确，后 4 个假值被忽略。
-控制器层硬编码 sale_type='complete', location_id='all'，所以假值不影响。
-```
-
-**关键发现：仅按日期统计的带参请求同样命中了通用汇总路由 #1！** 只是因为方法形参数少，多余假值参数被截断忽略。
-
-#### 路径 C-2：`summary_expenses_categories` 费用分类统计
-
-**场景 1：输入表单（2 段 URL）**
-
-```
-URL: reports/summary_expenses_categories（2段）
-
-匹配：
-  1. 路由 #1: 4段+ → ❌
-  2. 路由 #2: "summary_expenses_categories" 字面量精确匹配 → ✅
-  调用: Reports::date_input_only()
-```
-
-**场景 2：提交表单（7 段 URL）**
-
-```
-URL: reports/summary_expenses_categories/2024-01-01/2024-12-31/0/all/0（7段）
-
-匹配：
-  1. 路由 #1: reports/summary_(:any)/(:any)/(:any)（4段+） → ✅ 匹配！
-     （summary_expenses_categories 满足 summary_ 前缀！）
-     $1 = "expenses_categories"
-     $2 = "2024-01-01"
-     $3 = "2024-12-31/0/all/0"
-     $4 = ""
-     动态方法名: Summary_expenses_categories
-     参数分割: ["2024-01-01", "2024-12-31", "0", "all", "0", ""]（6个参数）
-
-  方法签名: summary_expenses_categories($start_date, $end_date, $sale_type)（3 个形参）
-  绑定:
-    $start_date = "2024-01-01"  ✅（段3）
-    $end_date   = "2024-12-31"  ✅（段4）
-    $sale_type  = "0"           ← ⚠️ 收到非法值 "0"（段5是前端拼的假值）
-    多余 "all", "0", "" 被忽略
-
-  结果：第 3 个参数 $sale_type 收到非法值 "0"，但模型层查询完全忽略此字段，所以不影响结果。
-```
-
----
-
-## 五、三条路径的命中方式综合对照表
-
-| 场景 | 路径 | URL 结构 | URL 段数 | 命中路由 | 动态方法名 | 实参数 | 形参数 | 多余参数 | 参数正确性 |
-|------|------|---------|---------|---------|-----------|--------|--------|---------|-----------|
-| **输入表单** | A 通用汇总（sales） | `reports/summary_sales` | 2 | #5 | —（固定 `date_input`） | 0 | 0 | 0 | ✅ |
-| | B-1 折扣汇总 | `reports/summary_discounts` | 2 | #4 | —（固定 `summary_discounts_input`） | 0 | 0 | 0 | ✅ |
-| | B-2 折扣明细 | `reports/specific_discounts` | 2 | #20 | —（固定 `specific_discount_input`） | 0 | 0 | 0 | ✅ |
-| | C-1 支付方式 | `reports/summary_payments` | 2 | #3 | —（固定 `date_input_only`） | 0 | 0 | 0 | ✅ |
-| | C-2 费用分类 | `reports/summary_expenses_categories` | 2 | #2 | —（固定 `date_input_only`） | 0 | 0 | 0 | ✅ |
-| **带参数请求** | A 通用汇总（sales） | `reports/summary_sales/start/end/type/loc/disc` | 7 | **#1** | `Summary_sales` | 6 | 4 | 2个（disc、空串） | ✅ 前 4 个正确 |
-| | B-1 折扣汇总 | `reports/summary_discounts/start/end/type/loc/disc` | 7 | **#1** | `Summary_discounts` | 6 | 5 | 1个（空串） | ✅ 前 5 个正确 |
-| | B-2 折扣明细 | `reports/specific_discounts/start/end/discval/type/disc` | 7 | **#17** | `Specific_discounts` | 5 | 5 | 0 | ✅ 全部正确 |
-| | C-1 支付方式 | `reports/summary_payments/start/end/fake0/fakeLoc/fakeDisc` | 7 | **#1** | `Summary_payments` | 6 | 2 | 4个 | ✅ 前 2 个正确 |
-| | C-2 费用分类 | `reports/summary_expenses_categories/start/end/fake0/...` | 7 | **#1** | `Summary_expenses_categories` | 6 | 3 | 3个 | ⚠️ 第3个收到假值 "0" |
-
----
-
-## 六、关键发现：路由 #1 是所有 summary_* 带参数请求的总入口
-
-**最重大的发现**：所有前缀为 `summary_` 的带参数（>=4 段）请求，无论是什么报表类型，全部命中**同一条路由 #1**：
-
-```
-reports/summary_sales/...          ↘
-reports/summary_items/...          ↘
-reports/summary_categories/...     ↘ 全部通过路由 #1 的动态方法名 Summary_$1
-reports/summary_customers/...      ↘ 分发到对应的控制器方法
-reports/summary_discounts/...      ↘
-reports/summary_payments/...       ↘
-reports/summary_expenses_categories/... ↘
-```
-
-路由 #1 的动态方法名机制：
-```php
-// $1 = summary_ 后面的部分
-// 方法名 = "Summary_" . $1
-
-// 例 1: reports/summary_sales/...
-$1 = "sales" → Summary_sales()
-
-// 例 2: reports/summary_expenses_categories/...
-$1 = "expenses_categories" → Summary_expenses_categories()
-
-// 例 3: reports/summary_discounts/...
-$1 = "discounts" → Summary_discounts()
-```
-
-这就是为什么系统只需要一条通配路由就能分发到十几个不同报表方法的核心机制。
-
----
-
-## 七、额外 URL 段如何继续传递参数
-
-### 7.1 两种参数传递模式的对比
-
-| 模式 | 触发条件 | 参数顺序来源 | 额外段处理 |
-|------|---------|-------------|-----------|
-| **通配路由模式**（当前系统主模式） | 命中带 `(:any)` 占位符的定义路由 | 1. 动态方法名之后的反向引用按顺序<br>2. `$multipleSegmentsOneParam=false` 时，含 `/` 的值按 `/` 再分割 | 末尾 `(:any)` 自然捕获，按 `/` 分割后多传的参数被 PHP 截断 |
-| **自动路由模式**（备用模式） | 所有定义路由均不匹配时触发 | URL 段 3, 段 4, 段 5, ... 的顺序直接绑定到形参 | 多余参数被 PHP 截断 |
-
-### 7.2 通配路由模式下的参数流转细节
-
-以路由 #1 为例，URL 段如何变成方法实参的完整链路：
-
-```
-URL 段 1: reports
-URL 段 2: summary_sales        ── 匹配单元 2 summary_(:any) → $1 = "sales"
-URL 段 3: 2024-01-01           ── 匹配单元 3 (:any) → $2 = "2024-01-01"
-URL 段 4: 2024-12-31           ──┐
-URL 段 5: complete                ├── 匹配单元 4（末尾 (:any)）→ $3 = "2024-12-31/complete/all/0"
-URL 段 6: all                     │                                  （含 /）
-URL 段 7: 0                     ──┘
-                                            ↓
-                  路由目标替换: Reports::Summary_$1/$2/$3/$4
-                                            ↓
-                             Reports::Summary_sales/2024-01-01/2024-12-31/complete/all/0/
-                                            ↓
-                          方法名后的参数部分按 / 分割（$multipleSegmentsOneParam=false）
-                                            ↓
-                    ["2024-01-01", "2024-12-31", "complete", "all", "0", ""]
-                                            ↓
-                       方法形参: summary_sales($start, $end, $type, $loc='all')
-                                            ↓
-                       $start_date = "2024-01-01"  ← 参数 1
-                       $end_date   = "2024-12-31"  ← 参数 2
-                       $sale_type  = "complete"    ← 参数 3
-                       $location_id= "all"         ← 参数 4
-                       参数 5 "0"、参数 6 "" 被 PHP 静默忽略
-```
-
-**注意**：因为 `$4` 悬空是空串，所以目标路径末尾永远有一个额外的 `/`，导致最后多出一个空字符串参数。
-
-### 7.3 末尾 `(:any)` 捕获的段数与实参数的对应关系
-
-以路由 #1 为例，末尾 `(:any)` 单元捕获 N 个段时：
-
-| URL 总段数 | 末尾 (:any) 捕获段数 | `$3` 的值 | `$4` | 参数部分分割后实参数 |
-|-----------|---------------------|----------|------|---------------------|
-| 4 段 | 1 段 | `b`（无 `/`） | `""` | 3 个：`[a, b, ""]` |
-| 5 段 | 2 段 | `b/c`（含 1 个 `/`） | `""` | 4 个：`[a, b, c, ""]` |
-| 6 段 | 3 段 | `b/c/d`（含 2 个 `/`） | `""` | 5 个：`[a, b, c, d, ""]` |
-| 7 段 | 4 段 | `b/c/d/e`（含 3 个 `/`） | `""` | 6 个：`[a, b, c, d, e, ""]` |
-
-**规律**：实参数 = 末尾 (:any) 捕获段数 + 2（非末尾占位符数）+ 1（悬空 `$4` 的空串）
-= 总段数 - 3（reports + summary_ + 中段占位符） + 3
-= 总段数
-
-当总段数 = 7 时，实参数 = 6（与上表一致）。
-
-### 7.4 什么时候会走自动路由？
-
-**在当前 OSPOS 的路由定义下，summary_* 系列报表的带参请求几乎不会走自动路由。** 因为：
-
-1. 路由 #1 的末尾 `(:any)` 可以匹配任意多个段（4 段或更多）
-2. 前端生成的 URL 是 7 段，满足 >= 4 段的条件
-3. 路由 #1 在所有 summary_* 字面量路由之前定义，所以会先被匹配
-
-**走自动路由的唯一可能性**：URL 段数 < 4 且 > 2，且字面量路由不匹配。例如：
-```
-URL: reports/summary_sales/a（3 段）
-
-匹配：
-  路由 #1: 需要 4段+ → ❌
-  路由 #2-#4: 字面量不匹配 → ❌
-  路由 #5: reports/summary_(:any)（末尾 (:any)，2段+） → ✅ 匹配！
-  $1 = "sales/a"（含 /，因为末尾 (:any) 可以跨段）
-  调用: Reports::date_input("sales", "a")
-  （$1 含 /，被分割成 2 个参数传递给 date_input()，但 date_input 无形参，参数被忽略）
-```
-
-所以 3 段 URL 会命中路由 #5（`date_input`），而不是走自动路由。
-
-**自动路由触发条件**：必须所有定义路由（包括末尾 `(:any)` 的 2 段+通配）都不匹配才会触发。在当前报表路由体系中，这种情况几乎不存在，因为末尾 `(:any)` 的通配模式覆盖了 2 段或更多的几乎所有情况。
-
----
-
-## 八、`$4` 悬空问题的实际影响
-
-| URL 段数 | `$4` 空串带来的额外参数 | 受影响方法 | 实际影响 |
-|---------|------------------------|-----------|---------|
-| 4 段 | 末尾空串（3→4 个参数） | `summary_sales` 等 4 形参方法 | `$location_id` 收到空串而非默认值（但前端几乎不生成 4 段 URL） |
-| 5 段 | 末尾空串（4→5 个参数） | `summary_sales` 等 4 形参方法 | 无影响（参数 5 被截断）；对 5 形参的 `summary_discounts`，第 5 形参 `$discount_type` 收到空串而非默认值 `0` |
-| 6 段 | 末尾空串（5→6 个参数） | 所有方法 | 无影响（多余的 1 个参数被截断） |
-| 7 段 | 末尾空串（6→7 个参数...实际还是 6 个，见上面规律分析） | 所有方法 | 无影响（多余参数都被截断） |
-
-**结论**：`$4` 悬空问题在前端生成 7 段 URL 的场景下几乎没有实质影响，只有在生成较少段数 URL 时才可能触发 bug。路由 #6（`graphical_` 系列）同样存在 `$4` 悬空问题，影响范围相同。
-
----
-
-## 九、各报表类型对应的方法分发表
-
-| 报表 URL 前缀 | 带参（>=4段）时命中路由 | 动态方法名 | 形参数 | 实参数（7段URL） | 多余参数 |
-|-------------|----------------------|-----------|--------|----------------|---------|
-| `reports/summary_sales/` | #1 | `Summary_sales` | 4 | 6 | 2 |
-| `reports/summary_items/` | #1 | `Summary_items` | 4 | 6 | 2 |
-| `reports/summary_categories/` | #1 | `Summary_categories` | 4 | 6 | 2 |
-| `reports/summary_customers/` | #1 | `Summary_customers` | 4 | 6 | 2 |
-| `reports/summary_suppliers/` | #1 | `Summary_suppliers` | 4 | 6 | 2 |
-| `reports/summary_employees/` | #1 | `Summary_employees` | 4 | 6 | 2 |
-| `reports/summary_taxes/` | #1 | `Summary_taxes` | 4 | 6 | 2 |
-| `reports/summary_sales_taxes/` | #1 | `Summary_sales_taxes` | 4 | 6 | 2 |
-| `reports/summary_discounts/` | #1 | `Summary_discounts` | 5 | 6 | 1 |
-| `reports/summary_payments/` | #1 | `Summary_payments` | 2 | 6 | 4 |
-| `reports/summary_expenses_categories/` | #1 | `Summary_expenses_categories` | 3 | 6 | 3 |
-| `reports/graphical_*/` | #6 | `Graphical_*` | 5 | 6 | 1 |
-| `reports/specific_discounts/` | #17 | `Specific_discounts` | 5 | 5 | 0 |
-| `reports/specific_customers/` | #17 | `Specific_customers` | 4 | 5+ | 1+ |
-| `reports/specific_employees/` | #17 | `Specific_employees` | 4 | 5+ | 1+ |
-| `reports/specific_suppliers/` | #17 | `Specific_suppliers` | 4 | 5+ | 1+ |
-| `reports/detailed_sales/` | #14 | `Detailed_sales` | 4 | 5+ | 1+ |
-| `reports/detailed_receivings/` | #14 | `Detailed_receivings` | 4 | 5+ | 1+ |
-| `reports/inventory_*/`（除low/summary） | #10 | `Inventory_*` | 2 | 3+ | 1+ |
-
----
-
-## 十、修正建议
-
-### 建议 1：修复 `$4` 悬空问题
-
-```php
-// 修正前（3 个占位符，4 个反向引用）
-$routes->add('reports/summary_(:any)/(:any)/(:any)', 'Reports::Summary_$1/$2/$3/$4');
-$routes->add('reports/graphical_(:any)/(:any)/(:any)', 'Reports::Graphical_$1/$2/$3/$4');
-
-// 修正后（去掉悬空的 $4，末尾 (:any) 会自然包含所有需要的参数）
-$routes->add('reports/summary_(:any)/(:any)/(:any)', 'Reports::Summary_$1/$2/$3');
-$routes->add('reports/graphical_(:any)/(:any)/(:any)', 'Reports::Graphical_$1/$2/$3');
-```
-
-去掉 `$4` 后，末尾多出的空串参数消失，参数个数减少 1。
-
-### 建议 2：统一参数个数与形参匹配
-
-当前通过 PHP 截断多余实参的方式虽然能工作，但属于"碰巧正确"。建议根据各方法实际形参数定义更精确的路由：
-
-```php
-// 对只有 2 个形参的 summary_payments，定义专用路由：
-$routes->add('reports/summary_payments/(:segment)/(:segment)', 'Reports::Summary_payments/$1/$2');
-
-// 对有 3 个形参的 summary_expenses_categories：
-$routes->add('reports/summary_expenses_categories/(:segment)/(:segment)', 'Reports::Summary_expenses_categories/$1/$2');
-// 并去掉方法签名中的 $sale_type 参数（因为模型层不用）
-```
-
-### 建议 3：`$multipleSegmentsOneParam` 评估
-
-考虑升级到 `$multipleSegmentsOneParam = true`，这样末尾 `(:any)` 捕获的多段值会作为单个参数，不会意外增加实参数，使路由行为更加可预测。但这是一个全局配置变更，需要评估对其他模块路由的影响。
+但这是因为 `$2` 对应段 3，`$3` 的 `/` 分割后顺序恰好与段顺序一致。**如果路由结构或 `$multipleSegmentsOneParam` 设置改变，这个对应关系就会打破。**
