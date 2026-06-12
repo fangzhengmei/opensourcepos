@@ -397,7 +397,7 @@ POS 页面选择客户 → postSelectCustomer()
     │       │
     │       └─► foreach ($payments as $payment):
     │             │
-    │             ├─► 支付方式=礼品卡：扣减礼品卡余额（与积分无关）
+    │             ├─► 支付方式=礼品卡：扣减礼品卡余额（⚠️ 金额会计入 total_amount 参与积分累计）
     │             │
     │             ├─► ★ 支付方式=积分（Rewards）：L585-L589
     │             │     │
@@ -454,7 +454,79 @@ $total_amount = floatval($total_amount) + floatval($payment['payment_amount']) -
 
 > 设计意图：积分抵扣视为一种"支付手段"，客户消费了 100 元的价值，理应按全额获得返点。
 
-### 3.6 完整时序图
+### 3.6 礼品卡支付对积分累计的影响
+
+#### 3.6.1 代码定位
+
+在 [Sale.php::save_value()](file:///d:/fz/0601-1/solo-dogfeeding/code/14-opensourcepos/app/Models/Sale.php#L579-L606) 的支付遍历逻辑中，礼品卡支付的金额被全额计入 `$total_amount`：
+
+```php
+foreach ($payments as $payment_id => $payment) {
+    // L580-L584：礼品卡支付 → 扣减礼品卡余额
+    if (!empty(strstr($payment['payment_type'], lang('Sales.giftcard')))) {
+        $splitpayment = explode(':', $payment['payment_type']);
+        $cur_giftcard_value = $giftcard->get_giftcard_value($splitpayment[1]);
+        $giftcard->update_giftcard_value($splitpayment[1], $cur_giftcard_value - $payment['payment_amount']);
+    }
+    // L585-L589：积分支付 → 扣减积分余额 + 累加 total_amount_used
+    elseif (!empty(strstr($payment['payment_type'], lang('Sales.rewards')))) {
+        // ...
+    }
+
+    // L591-L601：写入 sales_payments
+
+    // L603：★ 所有支付方式统一累加，含礼品卡、积分、现金
+    $total_amount = floatval($total_amount) + floatval($payment['payment_amount']) - floatval($payment['cash_refund']);
+}
+
+// L606：用累加后的 total_amount 计算积分
+$this->save_customer_rewards($customer_id, $sale_id, $total_amount, $total_amount_used);
+```
+
+**核心发现**：礼品卡支付的 `payment_amount` 被全额计入 `$total_amount`，进而在 `save_customer_rewards` 中参与了积分累计计算。
+
+#### 3.6.2 礼品卡 vs 积分支付的处理对比
+
+| 维度 | 积分支付（Rewards） | 礼品卡支付（Giftcard） | 是否计入积分累计 |
+|------|-------------------|---------------------|----------------|
+| 支付时扣减余额 | ✅ 扣减 `customers.points` | ✅ 扣减 `giftcards.value` | — |
+| `total_amount_used` 累加 | ✅ 累加 | ❌ 不累加 | — |
+| `total_amount` 累加 | ✅ 累加 | ✅ 累加 | — |
+| 最终积分累计计算 | ✅ 参与 earned 计算 | ✅ **参与 earned 计算** | ✅ |
+
+#### 3.6.3 业务场景推演
+
+**场景：现金 120 元 + 礼品卡 80 元，合计 200 元订单，积分比例 5%**
+
+当前计算：
+```
+total_amount = 80（礼品卡） + 120（现金） = 200
+earned = 200 × 5% = 10 积分
+```
+
+如果按"仅实付现金返积分"策略：
+```
+total_amount = 120（仅现金部分）
+earned = 120 × 5% = 6 积分
+```
+
+两种策略相差 4 积分，差异率 40%。
+
+#### 3.6.4 合理性分析
+
+礼品卡的积分返点是否合理，取决于礼品卡的发放来源：
+
+| 发放场景 | 发放时是否有现金流入 | 消费时返积分是否合理 |
+|---------|-------------------|-------------------|
+| 客户现金购买礼品卡 | ✅ 有（购卡时支付） | ✅ 合理（等价于现金支付） |
+| 营销活动赠送礼品卡 | ❌ 无（成本计入营销费用） | ⚠️ 存疑（相当于无成本获积分） |
+| 第三方/企业福利卡 | ⚠️ 结算时才有 | 取决于商务约定 |
+
+> **注意**：当前 [Giftcards.php 控制器](file:///d:/fz/0601-1/solo-dogfeeding/code/14-opensourcepos/app/Controllers/Giftcards.php) 在发售礼品卡时**未触发任何积分累计**。如果采用"礼品卡支付不返积分"的策略，需同步在购卡环节增加积分累计，否则客户在"购卡→消费"两个环节都拿不到积分。
+
+更多深度分析和修复方案见第十二章。
+
+### 3.7 完整时序图
 
 ```
 用户操作                        代码执行                          数据库变更
@@ -525,6 +597,8 @@ $total_amount = floatval($total_amount) + floatval($payment['payment_amount']) -
 | `points_percent` | `customers_packages` 表 | 各积分包的返点比例（百分比数值） |
 | `package_id` | `customers` 表 | 客户与积分包的关联字段，为空则不参与积分 |
 
+> **注意**：目前系统无单独的"礼品卡是否参与积分累计"配置开关。礼品卡支付金额会被全额计入 `total_amount` 参与积分计算（详见第三章 3.6 节和第十二章）。
+
 ---
 
 ## 五、代码优化建议
@@ -540,18 +614,18 @@ $total_amount = floatval($total_amount) + floatval($payment['payment_amount']) -
 
 顺序逻辑正确，但建议在 `save_customer_rewards` 中增加事务保护（当前已在外层事务中）。
 
-### 5.2 类型一致性问题
+### 5.2 类型一致性与强制截断问题
 
 ```php
 // Customer_rewards.php::get_points_percent() 返回 float
-// 但 customers.points 字段为 int，更新时传 int
+// customers.points 字段为 int，更新方法参数声明为 int
 // save_customer_rewards() L1393 计算结果为 float
 $total_amount_earned = ($total_amount * $points_percent / 100);  // float
 // L1394 累加到 points（int）后传入 update 方法
 $points = $points + $total_amount_earned;  // int + float → float
 ```
 
-建议在计算后加 `intval()` 或 `round()` 取整，避免浮点精度问题。
+PHP 在非严格模式下会对 `float → int` 执行**向零截断取整**，可能导致每笔交易少计 0~1 积分（详见第九章 9.2 节）。建议在计算后加 `intval()` 或 `round()` 取整，显式控制精度策略。
 
 ### 5.3 积分包下拉未处理 points 为 null 的情况
 
@@ -995,7 +1069,7 @@ float 存储 → 123456.77（末位偏差）
 
 | 问题 | 修复方案 |
 |------|----------|
-| PHP float → int TypeError | 在 `save_customer_rewards` 中调用前 `round()` 或 `intval()` |
+| PHP float → int 强制截断（向零取整） | 在 `save_customer_rewards` 中调用前 `round()` 或 `intval()` |
 | `sales_reward_points.earned` float 精度 | 改为 `DECIMAL(15,4)` |
 | `customers_packages.points_percent` float 精度 | 改为 `DECIMAL(5,2)` |
 | `customers.points` int 与 float 计算不匹配 | 统一使用 `DECIMAL` 或全部 `intval()` 取整 |
@@ -1014,7 +1088,7 @@ $this->db->transStart();        // ★ 事务开始
 
 // ① INSERT/UPDATE sales 表
 // ② 遍历支付：
-//      - 礼品卡扣减
+//      - 礼品卡扣减（update_giftcard_value）
 //      - ★ 积分扣减：update_reward_points_value()   ← 在事务内
 //      - INSERT sales_payments
 // ③ ★ 积分累计：save_customer_rewards()             ← 在事务内
@@ -1028,34 +1102,56 @@ $this->db->transComplete();     // ★ 事务结束
 return $this->db->transStatus() ? $sale_id : -1;
 ```
 
-### 10.2 CodeIgniter 4 事务机制分析
+### 10.2 CodeIgniter 4 事务内部追踪机制
 
-`transStart()` / `transComplete()` 的工作原理：
+#### 10.2.1 CI4 BaseConnection 的事务状态追踪原理
+
+CodeIgniter 4 的 `BaseConnection` 类维护一个**内部状态标志 `$_trans_status`**（布尔值，默认 `true`）。每次执行查询时，无论应用层是否接收返回值，连接对象都会自动追踪查询执行结果：
 
 ```
-transStart():
-    - 禁用自动提交
-    - 开始事务
+应用层调用 $builder->update(...) / insert(...) / delete(...)
+    │
+    └─→ BaseConnection::query() 底层执行 SQL
+            │
+            ├─→ 成功 → $_trans_status 保持当前值（不改变）
+            │
+            └─→ 失败（SQL 语法错误、主键冲突、锁超时、字段类型不匹配等）
+                    └─→ $_trans_status = false  ★ 内部自动标记失败
+                            │
+                            └─→ 与应用层方法的返回值类型无关
+                                即使方法返回 void，标志已写入连接对象
 
-transComplete():
-    - 检查是否有查询失败（transStatus 标志）
-    - 如果失败 → ROLLBACK
-    - 如果成功 → COMMIT
-    - 恢复自动提交
+应用层调用 $this->db->transComplete()
+    │
+    └─→ 检查内部 $_trans_status 标志
+            ├─→ true  → COMMIT
+            └─→ false → ROLLBACK  ★ 自动回滚整个事务
 ```
 
-关键点：CodeIgniter 4 通过**查询结果标志**来判断是否回滚，而非异常捕获。
+#### 10.2.2 项目中事务使用模式验证
 
-### 10.3 各积分操作的失败检测
+从项目代码中观察到一致的使用模式（以 [Supplier.php](file:///d:/fz/0601-1/solo-dogfeeding/code/14-opensourcepos/app/Models/Supplier.php#L113-L128) 为例）：
 
-| 操作 | 返回值 | 失败检测方式 | 是否影响 transStatus |
-|------|--------|-------------|---------------------|
-| `$builder->insert()` | bool | 返回 false 时设置标志 | ✅ 是 |
-| `$builder->update()` | bool | 返回 false 时设置标志 | ✅ 是 |
-| `update_reward_points_value()` | **void** | ★ **不返回任何值** | ❌ **否** |
-| `rewards->save_value()` | bool | 返回 false 时设置标志 | ✅ 是 |
+```php
+$this->db->transStart();
+// ... 一系列 insert/update ...
+$this->db->transComplete();
+$success &= $this->db->transStatus();  // ★ 统一通过 transStatus() 检查
+```
 
-### 10.4 致命问题：update_reward_points_value 无返回值
+多个模型（Tax_jurisdiction、Tax_category、Tax_code、Receiving 等）均采用相同模式，**从未检查单个 update/insert 的返回值**，全部依赖 `transStatus()` 最终检查。这证明 CI4 内部追踪机制是项目默认依赖的设计。
+
+### 10.3 各积分操作的失败检测与回滚验证
+
+| 操作 | 应用层返回值 | 底层调用 `$builder->update()` | CI4 内部是否标记 `$_trans_status=false` | 事务回滚 |
+|------|------------|----------------------------|---------------------------------------|----------|
+| `$builder->insert()` | bool | 是 | ✅ 是 | ✅ 是 |
+| `$builder->update()` | bool | 是 | ✅ 是 | ✅ 是 |
+| `update_reward_points_value()` | **void** | 是（内部调用 `$builder->update()`） | ✅ 是（CI4 内部追踪） | ✅ 是 |
+| `update_giftcard_value()` | **void** | 是（内部调用 `$builder->update()`） | ✅ 是（CI4 内部追踪） | ✅ 是 |
+| `rewards->save_value()` | bool | 是 | ✅ 是 | ✅ 是 |
+
+### 10.4 `update_reward_points_value` 的真实行为
 
 [Customer.php L239-L244](file:///d:/fz/0601-1/solo-dogfeeding/code/14-opensourcepos/app/Models/Customer.php#L239-L244)：
 
@@ -1065,18 +1161,28 @@ public function update_reward_points_value(int $customer_id, int $value): void
     $builder = $this->db->table('customers');
     $builder->where('person_id', $customer_id);
     $builder->update(['points' => $value]);
-    // ★ 返回类型为 void，不检查 $builder->update() 的结果
-    // ★ 即使 UPDATE 失败，也不会设置 transStatus 为 false
+    // 返回值被丢弃，但 CI4 连接层内部已将执行结果写入 $_trans_status
+    // 如果 update() 返回 false，BaseConnection::query() 已自动设置 $_trans_status = false
 }
 ```
 
-**影响链路**：
+**关键点**：`$builder->update()` 返回 `bool`，但该返回值被方法忽略。然而，在 `$builder->update()` 调用 `BaseConnection::query()` 执行 SQL 时，**连接对象内部已经根据执行结果更新了 `$_trans_status`**，与应用层是否接收返回值无关。
 
-1. **积分扣减失败**（L587）→ `update_reward_points_value` 返回 void → `transStatus` 不受影响 → **事务不回滚** → 销售记录已保存，但积分未被扣减 → **积分虚增**
-2. **积分累计失败**（L1396）→ 同上 → **事务不回滚** → 销售记录已保存，但积分未累计 → **积分少计**
-3. **积分流水写入失败**（L1400）→ `rewards->save_value()` 返回 bool → 如果返回 false，CodeIgniter 会检测到 → **事务回滚** ✅
+### 10.5 典型失败场景的回滚验证
 
-### 10.5 嵌套事务问题
+假设以下失败场景发生在事务内，验证是否能正确回滚：
+
+| 失败场景 | 发生位置 | `$_trans_status` 是否为 false | 事务结果 | 积分一致性 |
+|---------|---------|----------------------------|----------|-----------|
+| WHERE 条件匹配 0 行（客户被删除） | L587 积分扣减 | ✅ 是（affected_rows=0 时 CI4 视为成功，但逻辑上失败） | COMMIT ⚠️ | 积分未扣减但销售已保存 |
+| SQL 语法错误 / 字段类型错误 | 任意 update | ✅ 是 | ROLLBACK ✅ | 无影响 |
+| 锁等待超时（InnoDB lock wait timeout） | 任意 update | ✅ 是 | ROLLBACK ✅ | 无影响 |
+| 数据库连接断开 | 任意查询 | ✅ 是 | ROLLBACK ✅ | 无影响 |
+| 积分流水 `rewards->save_value` 失败 | L1400 | ✅ 是 | ROLLBACK ✅ | 无影响 |
+
+**注意**：`affected_rows=0` 的情况（如 WHERE 条件匹配不到行）CI4 视为成功返回，但从业务逻辑看属于失败。这种场景下 `$_trans_status` 仍为 `true`，事务会 COMMIT，导致**积分未扣减但销售已保存**。这是一个逻辑层面的问题，不是 CI4 事务机制的问题。
+
+### 10.6 嵌套事务问题
 
 `save_value()` 中调用了 `clear_suspended_sale_detail()`（L543），该方法内部也有自己的事务：
 
@@ -1084,48 +1190,54 @@ public function update_reward_points_value(int $customer_id, int $value): void
 // Sale.php L1330-L1356
 public function clear_suspended_sale_detail(int $sale_id): bool
 {
-    $this->db->transStart();    // ★ 嵌套事务
+    $this->db->transStart();    // ★ 嵌套事务（SAVEPOINT）
     // ... 删除 payments, items, taxes ...
     $this->db->transComplete();
     return $this->db->transStatus();
 }
 ```
 
-CodeIgniter 4 支持嵌套事务（通过 savepoint），但 `clear_suspended_sale_detail` 的返回值在 `save_value` 中**未被检查**：
+CodeIgniter 4 支持嵌套事务（通过 SAVEPOINT），但 `clear_suspended_sale_detail` 的返回值在 `save_value` 中**未被检查**：
 
 ```php
 // Sale.php L542-L544
 if ($sale_id != NEW_ENTRY) {
     $this->clear_suspended_sale_detail($sale_id);
-    // ★ 返回值被忽略！如果清空失败，后续仍会继续写入
+    // ★ 返回值被忽略！子事务失败时只会回滚到 savepoint，外层事务继续执行
 }
 ```
 
-### 10.6 事务回滚完整性矩阵
+### 10.7 事务回滚完整性矩阵（最终修正版）
 
 | 失败环节 | 是否触发回滚 | 回滚范围 | 积分一致性影响 |
 |----------|-------------|---------|---------------|
 | INSERT sales 失败 | ✅ | 整个事务 | 无影响（全部回滚） |
-| 积分扣减 `update_reward_points_value` 失败 | ❌ | **不回滚** | **积分虚增**（销售已保存但积分未扣减） |
-| 积分累计 `update_reward_points_value` 失败 | ❌ | **不回滚** | **积分少计**（销售已保存但积分未累计） |
+| 积分扣减 `update_reward_points_value` SQL 执行失败 | ✅ | 整个事务（CI4 内部机制） | 无影响（全部回滚） |
+| 积分扣减 WHERE 匹配 0 行（逻辑失败） | ❌ | 不回滚（CI4 视为成功） | **积分虚增**（销售已保存但积分未扣减） |
+| 积分累计 `update_reward_points_value` SQL 执行失败 | ✅ | 整个事务（CI4 内部机制） | 无影响（全部回滚） |
+| 积分累计 WHERE 匹配 0 行（逻辑失败） | ❌ | 不回滚（CI4 视为成功） | **积分少计**（销售已保存但积分未累计） |
+| 礼品卡扣减 `update_giftcard_value` 失败 | ✅ | 整个事务（CI4 内部机制） | 无影响（全部回滚） |
 | 积分流水 `rewards->save_value` 失败 | ✅ | 整个事务 | 无影响（全部回滚） |
 | INSERT sales_items 失败 | ✅ | 整个事务 | 无影响（全部回滚） |
-| `clear_suspended_sale_detail` 失败 | ❌ | 仅子事务 | 销售明细重复/混乱 |
+| `clear_suspended_sale_detail` 子事务失败 | ⚠️ 部分 | 仅子事务回滚到 savepoint | 可能造成销售明细重复 |
 
-### 10.7 修复建议
+### 10.8 修复建议
 
-**1. `update_reward_points_value` 改为返回 bool**
+**1. 增加受影响行数校验（解决 WHERE 匹配 0 行问题）**
 
 ```php
 public function update_reward_points_value(int $customer_id, int $value): bool
 {
     $builder = $this->db->table('customers');
     $builder->where('person_id', $customer_id);
-    return $builder->update(['points' => $value]) !== false;
+    $builder->update(['points' => $value]);
+    
+    // 检查受影响行数，0 行也视为失败
+    return $this->db->affectedRows() > 0;
 }
 ```
 
-**2. 在 save_value 中检查返回值**
+**2. 在 save_value 中检查返回值并显式回滚**
 
 ```php
 // 积分扣减
@@ -1146,6 +1258,10 @@ if ($sale_id != NEW_ENTRY) {
 }
 ```
 
+**4. `update_giftcard_value` 同样需要增加返回值（与积分对称）**
+
+[Giftcard.php L307-L312](file:///d:/fz/0601-1/solo-dogfeeding/code/14-opensourcepos/app/Models/Giftcard.php#L307-L312) 当前也是 `void`，与积分存在相同的 `affected_rows=0` 逻辑失败问题。
+
 ---
 
 ## 十一、综合风险评估与优先级建议
@@ -1153,8 +1269,168 @@ if ($sale_id != NEW_ENTRY) {
 | 风险 | 严重程度 | 发生概率 | 修复优先级 | 修复难度 |
 |------|---------|---------|-----------|---------|
 | 删除销售不回退积分 | **严重** | 高（每次删除都触发） | P0 | 中 |
-| `update_reward_points_value` 返回 void 导致静默失败 | **严重** | 低（DB异常时触发） | P0 | 低 |
-| PHP 8.1+ float→int TypeError | **严重** | 高（每次积分累计都触发） | P0 | 低 |
-| 多终端竞态条件 | 中 | 低 | P1 | 中 |
-| 浮点精度累积误差 | 低 | 确定（长期运行） | P2 | 中 |
-| 退货+积分支付双重回退 | 中 | 低 | P1 | 高 |
+| 积分扣减/累计 WHERE 匹配 0 行（逻辑失败，CI4 视为成功不回滚） | **严重** | 中（客户数据异常时触发） | P0 | 低 |
+| PHP 强制截断积分（float→int 向零取整） | 中 | **高（每笔交易都触发）** | P1 | 低 |
+| 礼品卡支付金额计入积分累计（设计缺陷） | 中 | 高（每笔礼品卡支付都触发） | P1 | 中 |
+| 多终端竞态条件（先读后写覆盖） | 中 | 低（需并发结账） | P1 | 中 |
+| 退货+积分支付双重回退逻辑 | 中 | 低（退货场景少见） | P1 | 高 |
+| `update_reward_points_value` 返回 void（仅影响可观测性，不影响事务回滚） | 低 | 低（仅调试时不便） | P2 | 低 |
+| `update_giftcard_value` 返回 void（同上） | 低 | 低 | P2 | 低 |
+| 浮点精度累积误差（MySQL float 存储） | 低 | 确定（长期运行缓慢累积） | P2 | 中 |
+| `clear_suspended_sale_detail` 返回值被忽略 | 低 | 低（仅编辑挂起单时触发） | P2 | 低 |
+
+---
+
+## 十二、礼品卡支付计入积分累计的设计问题分析
+
+### 12.1 问题定位
+
+在 [Sale.php::save_value()](file:///d:/fz/0601-1/solo-dogfeeding/code/14-opensourcepos/app/Models/Sale.php#L579-L606) 的支付遍历逻辑中：
+
+```php
+foreach ($payments as $payment_id => $payment) {
+    // L580-L584：礼品卡支付 → 扣减礼品卡余额
+    if (!empty(strstr($payment['payment_type'], lang('Sales.giftcard')))) {
+        $splitpayment = explode(':', $payment['payment_type']);
+        $cur_giftcard_value = $giftcard->get_giftcard_value($splitpayment[1]);
+        $giftcard->update_giftcard_value($splitpayment[1], $cur_giftcard_value - $payment['payment_amount']);
+    }
+    // L585-L589：积分支付 → 扣减积分余额 + 累加 total_amount_used
+    elseif (!empty(strstr($payment['payment_type'], lang('Sales.rewards')))) {
+        $cur_rewards_value = $customer->get_info($customer_id)->points;
+        $customer->update_reward_points_value($customer_id, $cur_rewards_value - $payment['payment_amount']);
+        $total_amount_used = floatval($total_amount_used) + floatval($payment['payment_amount']);
+    }
+
+    // L591-L601：写入 sales_payments 表
+
+    // L603：★ 所有支付方式统一累加 total_amount
+    // 含：现金、积分、礼品卡、银行卡、支票……全部计入
+    $total_amount = floatval($total_amount) + floatval($payment['payment_amount']) - floatval($payment['cash_refund']);
+}
+
+// L606：用累加后的 total_amount 计算积分
+$this->save_customer_rewards($customer_id, $sale_id, $total_amount, $total_amount_used);
+```
+
+**核心问题**：礼品卡支付的 `payment_amount` 被全额计入了 `$total_amount`，进而在 `save_customer_rewards` 中参与了积分累计计算。
+
+### 12.2 三种支付方式的处理对比
+
+| 维度 | 现金/刷卡支付 | 积分支付（Rewards） | 礼品卡支付（Giftcard） |
+|------|------------|-------------------|---------------------|
+| 支付时扣减余额 | 不适用 | ✅ 扣减 `customers.points` | ✅ 扣减 `giftcards.value` |
+| 累加到 `total_amount_used` | ❌ | ✅ 累加 | ❌ 不累加 |
+| 累加到 `total_amount` | ✅ 累加 | ✅ 累加 | ✅ **累加** |
+| 参与 earned 积分计算 | ✅ | ✅ | ✅ **参与** |
+
+### 12.3 礼品卡积分返点的合理性分析
+
+礼品卡的积分返点是否合理，**取决于礼品卡的发放来源**：
+
+#### 场景 A：客户用现金购买门店发售的礼品卡
+
+- **购卡时**：客户支付 100 元现金 → `Giftcards::save_value()` 写入礼品卡记录 → **此环节不产生积分**
+- **消费时**：用礼品卡消费 100 元 → 当前逻辑按 100 元累计 5 积分 → ✅ **合理**（等价于延迟的现金支付）
+- **问题**：购卡时无积分，消费时才有积分——积分发放节点后移，对客户无损失
+
+#### 场景 B：营销活动赠送礼品卡（如满 500 送 100 礼品卡）
+
+- **赠送时**：无现金流入，直接创建礼品卡 → **此环节不产生积分**
+- **消费时**：用赠送的 100 元礼品卡消费 → 当前逻辑仍按 100 元返 5 积分 → ⚠️ **不合理**（相当于无成本双重获利）
+- **双重损失**：商家既付出了礼品卡成本，又额外付出了积分成本
+
+#### 场景 C：第三方储值卡 / 企业福利卡
+
+- **充值时**：由第三方/企业批量充值，门店无法追踪资金来源
+- **消费时**：门店按实际刷卡金额与第三方结算 → 是否返积分取决于商务合同
+- **当前行为**：一律按金额返积分 → 可能不符合商务约定
+
+### 12.4 业务推演：现金+礼品卡混合支付
+
+**示例**：订单金额 200 元，客户用礼品卡支付 80 元 + 现金支付 120 元，积分比例 5%
+
+```
+当前算法：
+  total_amount = 80（礼品卡） + 120（现金） = 200
+  earned = 200 × 5% = 10 积分  ★ 礼品卡 80 元也产生了 4 积分
+
+严格返点（仅实付现金返积分）：
+  total_amount = 120（仅现金部分）
+  earned = 120 × 5% = 6 积分
+
+差异：
+  - 积分差额：4 积分
+  - 差异率：40%（礼品卡占比越高，差异越大）
+```
+
+### 12.5 与积分支付的对称性分析
+
+积分支付（Rewards）同样被计入 `total_amount`（见第三章 3.5 节），设计意图是"积分抵扣视为支付手段，按订单全额返点"。但礼品卡与积分有本质区别：
+
+| 维度 | 积分（Rewards） | 礼品卡（Giftcard） |
+|------|---------------|------------------|
+| 是否由消费行为产生 | ✅ 每笔消费累计而来 | ❌ 发售/赠送产生 |
+| 是否有对应现金流入 | ✅ 有（积分产生时的消费已支付） | ⚠️ 现金购卡时有，赠送时无 |
+| 系统内可追踪来源 | ✅ 每条积分流水可追溯 | ⚠️ 仅追踪余额变动 |
+| 清零规则 | 通常有有效期 | 通常无有效期 |
+
+**结论**：积分支付计入返点基数是合理的（积分是消费的果实），但礼品卡是否计入应区分来源。
+
+### 12.6 修复建议
+
+**方案 A：引入配置开关（推荐，向后兼容）**
+
+在系统配置中增加 `giftcard_earn_rewards` 开关：
+- `true`（默认值，保持当前行为）：礼品卡支付金额参与积分累计
+- `false`：礼品卡支付金额不计入积分累计
+
+代码修改位置：[Sale.php L603](file:///d:/fz/0601-1/solo-dogfeeding/code/14-opensourcepos/app/Models/Sale.php#L603)
+
+```php
+$exclude_giftcard = !$config['giftcard_earn_rewards'] 
+    && !empty(strstr($payment['payment_type'], lang('Sales.giftcard')));
+
+if (!$exclude_giftcard) {
+    $total_amount = floatval($total_amount) + floatval($payment['payment_amount']) - floatval($payment['cash_refund']);
+}
+```
+
+**方案 B：按礼品卡发放来源区分**
+
+在 `giftcards` 表增加 `source_type` 字段（枚举：`cash_purchase` / `promotion` / `third_party`），消费时根据来源判断是否返积分。
+
+优点：精确区分；缺点：需新增字段和改造购卡/发卡流程。
+
+**方案 C：在购卡环节直接发放积分**
+
+如果选择"礼品卡支付不返积分"，则需同步在礼品卡发售（客户现金购卡）环节增加积分累计：
+
+```php
+// Giftcards::save_value() 中新增
+if ($sale_with_customer && $customer_id && $config['customer_reward_enable']) {
+    // 购卡时按购卡金额发放积分
+    $points_percent = $customer_rewards->get_points_percent($package_id);
+    $earned = $value * $points_percent / 100;
+    $customer->update_reward_points_value($customer_id, $current_points + $earned);
+}
+```
+
+否则客户在"现金购卡 → 礼品卡消费"两个环节都拿不到积分，造成积分损失。
+
+### 12.7 相关的事务回滚问题
+
+礼品卡的 `update_giftcard_value()` 方法也是 `void` 返回值：
+
+[Giftcard.php L307-L312](file:///d:/fz/0601-1/solo-dogfeeding/code/14-opensourcepos/app/Models/Giftcard.php#L307-L312)
+
+```php
+public function update_giftcard_value(string $giftcard_number, float $value): void
+{
+    $builder = $this->db->table('giftcards');
+    $builder->where('giftcard_number', $giftcard_number);
+    $builder->update(['value' => $value]);
+}
+```
+
+与积分的 `update_reward_points_value()` 相同，SQL 执行失败时 CI4 内部 `$_trans_status` 机制保证事务回滚，但存在 `affected_rows=0`（礼品卡号不存在）的逻辑失败风险。
