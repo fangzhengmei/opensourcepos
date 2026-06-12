@@ -45,12 +45,25 @@ OSPOS 系统的收据通知功能目前仅支持**邮件**发送，**短信**功
 
 #### 2.2 销售编辑弹窗：form.php
 
-**位置**：[form.php](file:///d:/fz/0601-1/solo-dogfeeding/code/19-opensourcepos/app/Views/sales/form.php#L156-L171)
+**位置**：[form.php](file:///d:/fz/0601-1/solo-dogfeeding/code/19-opensourcepos/app/Views/sales/form.php#L38-L46)、[form.php](file:///d:/fz/0601-1/solo-dogfeeding/code/19-opensourcepos/app/Views/sales/form.php#L156-L171)
 
 **触发方式**：
 - 没有自动发送
 - 用户点击按钮 → 弹出确认框 → 确认后调用
-- **需要客户有邮箱**（`$sale_info['email']` 不为空才显示按钮）
+
+**按钮显示的完整前置条件（必须同时满足）**：
+1. 系统开启发票功能：`$config['invoice_enable']`
+2. 当前销售已有发票号：`!empty($sale_info["invoice_number"])`
+3. 当前销售关联了客户：`isset($sale_info['customer_id'])`
+4. 该客户有邮箱：`!empty($sale_info['email'])`
+
+**数据来源补充**：
+- `sale_info['email']` 不是临时拼出来的前端变量，而是 [Sale::get_info()](file:///d:/fz/0601-1/solo-dogfeeding/code/19-opensourcepos/app/Models/Sale.php#L64-L87) 查询里的 `MAX(customer_p.email) AS email`
+- 因此这里校验的是“销售关联客户的人物邮箱字段是否存在”
+
+**点击事件的额外保护**：
+- [form.php](file:///d:/fz/0601-1/solo-dogfeeding/code/19-opensourcepos/app/Views/sales/form.php#L156-L171) 在绑定 `#send_invoice` 点击事件时，又额外检查了一次 `!empty($sale_info['email'])`
+- 这不会新增可达场景，只是对“无邮箱时不发送”做了第二层防御
 
 **调用接口**：`GET /sales/sendPdf/{sale_id}`（type 默认为 invoice）
 
@@ -385,23 +398,38 @@ OSPOS 系统的收据通知功能目前仅支持**邮件**发送，**短信**功
 
 #### 2.2 销售编辑弹窗手动发送
 
+**按钮显示的完整前置条件（必须全部满足）**：
+
+| # | 条件 | 代码位置 | 数据来源 |
+|---|---|---|---|
+| 1 | 系统开启发票功能 | [form.php L38](file:///d:/fz/0601-1/solo-dogfeeding/code/19-opensourcepos/app/Views/sales/form.php#L38) `$config['invoice_enable']` | 系统配置 |
+| 2 | 已有发票号 | [form.php L42](file:///d:/fz/0601-1/solo-dogfeeding/code/19-opensourcepos/app/Views/sales/form.php#L42) `!empty($sale_info["invoice_number"])` | `ospos_sales.invoice_number` 字段 |
+| 3 | 关联了客户 | [form.php L42](file:///d:/fz/0601-1/solo-dogfeeding/code/19-opensourcepos/app/Views/sales/form.php#L42) `isset($sale_info['customer_id'])` | `ospos_sales.customer_id` 字段 |
+| 4 | 客户有邮箱 | [form.php L42](file:///d:/fz/0601-1/solo-dogfeeding/code/19-opensourcepos/app/Views/sales/form.php#L42) `!empty($sale_info['email'])` | `ospos_people.email` 字段（通过 JOIN 客户表获得） |
+
+**注**：`sale_info['email']` 来自 [Sale::get_info()](file:///d:/fz/0601-1/solo-dogfeeding/code/19-opensourcepos/app/Models/Sale.php#L71) 的 SQL 查询 `MAX(customer_p.email) AS email`，即客户关联人的邮箱。
+
+**按钮的点击事件绑定额外条件**：
+- [form.php L156](file:///d:/fz/0601-1/solo-dogfeeding/code/19-opensourcepos/app/Views/sales/form.php#L156) 再次检查 `!empty($sale_info['email'])` —— 即使按钮渲染出来了，如果没有邮箱也不会绑定点击事件（但按钮显示条件里已经包含了邮箱检查，所以这个是冗余保护）
+
 ```
 销售详情/编辑弹窗 (form.php)
-  → 用户点击"发送发票"按钮
-    → 弹出确认框
-    → 确认后 AJAX GET /sales/sendPdf/{sale_id}
-      → Sales::getSendPdf()
-        → _load_sale_data()
-        → 生成 PDF
-        → Email_lib::sendEmail() 发送
-        → clear_all()
-          → 返回 JSON
-            → 关闭弹窗 + 前端显示通知
+  前置条件同时满足：发票功能开启 + 已有发票号 + 关联客户 + 客户有邮箱
+    → "发送发票"链接显示在发票号输入框右侧
+      → 用户点击 → 弹出确认框（显示客户邮箱）
+        → 确认后 AJAX GET /sales/sendPdf/{sale_id}
+          → Sales::getSendPdf()
+            → _load_sale_data()
+            → 生成 PDF
+            → Email_lib::sendEmail() 发送
+            → clear_all()
+              → 返回 JSON
+                → 关闭弹窗 + 前端显示通知
 ```
 
 ---
 
-### 路径 3：查看历史收据/发票（有副作用）
+### 路径 3：查看历史收据（有副作用）
 
 ```
 销售编辑弹窗 (form.php)
@@ -417,7 +445,10 @@ OSPOS 系统的收据通知功能目前仅支持**邮件**发送，**短信**功
 【副作用】：如果另一个标签页正在编辑新销售，购物车等数据会被清空。
 ```
 
-**同理适用于查看历史发票**：`GET /sales/invoice/{sale_id}` → `Sales::getInvoice()`
+**补充说明：历史发票路径只能确认“控制器可访问”，不能确认“前端真实可达”**：
+- `Sales::getInvoice()` 的内部行为与 `getReceipt()` 同型：同样会 `_load_sale_data()`，同样会再次 `clear_all()`
+- 但在 `app/Views` 里没有找到 `/sales/invoice/{sale_id}` 的前端链接或按钮证据
+- 因此更稳妥的结论是：`GET /sales/invoice/{sale_id}` 作为手动访问 URL 会有同样副作用，但不能像历史收据那样写成已证实的前端入口链路
 
 ---
 
@@ -444,7 +475,7 @@ OSPOS 系统的收据通知功能目前仅支持**邮件**发送，**短信**功
 | 发送邮件（getSendPdf） | 2 | _load_sale_data 内部 + 方法末尾 |
 | 发送邮件（getSendReceipt） | 2 | _load_sale_data 内部 + 方法末尾 |
 | 查看历史收据（getReceipt） | 2 | _load_sale_data 内部 + 方法末尾 |
-| 查看历史发票（getInvoice） | 2 | _load_sale_data 内部 + 方法末尾 |
+| 手动访问历史发票（getInvoice，无前端入口证据） | 2 | _load_sale_data 内部 + 方法末尾 |
 
 **一次完整结账+自动发邮件累计调用 3 次 clear_all()**
 
@@ -464,7 +495,7 @@ OSPOS 系统的收据通知功能目前仅支持**邮件**发送，**短信**功
 
 ---
 
-## 八、潜在问题与注意事项
+## 九、潜在问题与注意事项
 
 1. **无发送状态记录**：`ospos_sales` 表没有邮件/短信发送状态字段，无法追溯某笔销售的收据是否已发送，也无法防止重复发送
 2. **前端驱动**：邮件发送依赖收据页面加载时的 JS 自动触发，如果用户在页面加载前关闭浏览器则不会发送
@@ -475,7 +506,7 @@ OSPOS 系统的收据通知功能目前仅支持**邮件**发送，**短信**功
 7. **getSendReceipt 是死代码**：后端定义了 `getSendReceipt()` 方法，但前端没有任何代码调用它。实际所有发送都走 `getSendPdf()`
 8. **last 模式跨单记忆偏差**：`email_receipt_check_behaviour=last` 配置注释写"记住上次"，但 `clear_all()` 在销售完成时清空 Session，实际**不会跨单记忆**，仅在同一单多次操作间有效
 9. **多标签页会话冲突（发送邮件）**：两个标签页共享 Session，一个标签页的发送邮件操作（内部 clear_all）可能清空另一个标签页正在编辑的销售内容
-10. **多标签页会话冲突（查看历史单据）**：在新标签页查看历史收据/发票（`getReceipt` / `getInvoice`）会调用 `_load_sale_data()` 和 `clear_all()`，清空当前正在编辑的购物车
+10. **多标签页会话冲突（查看历史单据）**：在新标签页查看历史收据（`getReceipt`），或手动访问历史发票 URL（`getInvoice`）时，会调用 `_load_sale_data()` 和 `clear_all()`，清空当前正在编辑的购物车
 11. **展示与发送数据源不一致**：页面展示的是结账时的临时内存数据，邮件里的是数据库回填的数据，虽然正常情况下一致，但存在理论上的不一致窗口
 12. **clear_all() 过度调用**：完成一次结账+发送邮件，会连续调用 3 次 `clear_all()`；查看一次历史收据也会调用 2 次 `clear_all()`，虽然结果正确但略显冗余
-13. **查看历史单据的副作用被低估**：`getReceipt()` / `getInvoice()` 方法名看起来是"只读"操作，但实际上有修改 Session 的副作用，违反了直觉预期
+13. **查看历史单据的副作用被低估**：`getReceipt()` 以及手动访问的 `getInvoice()` 方法名看起来是"只读"操作，但实际上有修改 Session 的副作用，违反了直觉预期
