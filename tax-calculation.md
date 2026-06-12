@@ -369,6 +369,121 @@ foreach ($tax_definition as $tax) {
 | 10.04 | 13% | 1.3052 | 1.31 |
 | 99.99 | 13% | 12.9987 | 13.00 |
 
+### 7.5 HALF_ODD：两处实现的不一致性
+
+#### 7.5.1 为什么会有两处实现
+
+税费计算中存在**两套独立的舍入实现**，分别服务于不同的计算阶段：
+
+| 阶段 | 调用路径 | 实现函数 | 适用场景 |
+|------|---------|---------|---------|
+| 单项税额计算 | `get_tax_for_amount()` | [Rounding_mode::round_number()](file:///d:/fz/0601-1/solo-dogfeeding/code/17-opensourcepos/app/Models/Enums/Rounding_mode.php#L70-L85) | 目的地税制下，每个商品每个税种的单项税额计算 |
+| 最终汇总舍入 | `round_taxes()` | [Tax_lib::round_taxes()](file:///d:/fz/0601-1/solo-dogfeeding/code/17-opensourcepos/app/Libraries/Tax_lib.php#L252-L294) | 按税种分组累加后，对总税额做最终舍入 |
+
+> **注意**：基础税制下两处都硬编码为 `HALF_UP`，因此不存在不一致问题。仅**目的地税制**下会触发 `tax_rates.tax_rounding_code` 配置的其他舍入模式。
+
+#### 7.5.2 HALF_ODD 的两处实现对比
+
+**单项计算 — Rounding_mode::round_number()**：
+
+```php
+} else {
+    $rounded_total = round($amount, $decimals, $rounding_mode);
+}
+```
+
+此处 `$rounding_mode` 直接使用传入的 `Rounding_mode::HALF_ODD`（值为 4），即 PHP 原生的 `PHP_ROUND_HALF_ODD`。**行为正确**：当小数部分恰好为 0.5 时，向最近的奇数舍入。
+
+**最终汇总 — Tax_lib::round_taxes()**：
+
+```php
+} elseif ($rounding_code == Rounding_mode::HALF_ODD) {
+    $rounded_tax_amount = round($tax_amount, $decimals, PHP_ROUND_HALF_UP);
+}
+```
+
+此处**硬编码为 `PHP_ROUND_HALF_UP`**，而非 `PHP_ROUND_HALF_ODD`。这是一个实现错误：当舍入模式为 HALF_ODD 时，最终汇总阶段实际执行的是 HALF_UP（四舍五入）。
+
+#### 7.5.3 数值差异示例
+
+设 `decimals = 2`，待舍入值恰好为 `x.xx5`（即 0.5 边界）：
+
+| 待舍入值 | 正确 HALF_ODD 结果 | 实际（HALF_UP）结果 | 差异 |
+|---------|-------------------|-------------------|------|
+| 10.115 | 10.11（第 2 位小数 1 是奇数，舍去 5） | 10.12（四舍五入，5 进 1） | 差 0.01 |
+| 10.125 | 10.13（第 2 位小数 2 是偶数，向奇数 3 靠拢） | 10.13（四舍五入，5 进 1） | 相同 |
+| 10.135 | 10.13（第 2 位小数 3 是奇数，舍去 5） | 10.14（四舍五入，5 进 1） | 差 0.01 |
+
+**结论**：当小数点第 `decimals+1` 位恰好为 5 且第 `decimals` 位是奇数时，两处实现会产生 `1` 个最低位的差异。
+
+### 7.6 HALF_FIVE：两处实现的三处不一致
+
+#### 7.6.1 三处实现代码对比
+
+代码库中实际上存在 **三套** HALF_FIVE 实现，分别用于不同场景：
+
+| 位置 | 函数 | 代码 |
+|------|------|------|
+| 单项计算 | [Rounding_mode::round_number()](file:///d:/fz/0601-1/solo-dogfeeding/code/17-opensourcepos/app/Models/Enums/Rounding_mode.php#L78-L79) | `round($amount / 5, $decimals, Rounding_mode::HALF_EVEN) * 5` |
+| 最终汇总 | [Tax_lib::round_taxes()](file:///d:/fz/0601-1/solo-dogfeeding/code/17-opensourcepos/app/Libraries/Tax_lib.php#L288-L289) | `round($tax_amount / 5) * 5` |
+| 数据迁移 | [Migration_Sales_Tax_Data::round_number()](file:///d:/fz/0601-1/solo-dogfeeding/code/17-opensourcepos/app/Database/Migrations/20170502221506_sales_tax_data.php#L278-L279) | `round($amount / 5) * 5` |
+
+迁移文件的实现与 `Tax_lib::round_taxes()` 一致。
+
+#### 7.6.2 差异一：小数位参数
+
+**单项计算**：`round($amount / 5, $decimals, ...)` —— 明确传入了 `$decimals` 参数
+**最终汇总**：`round($tax_amount / 5)` —— **未传入 precision 参数**，PHP `round()` 默认 precision 为 `0`
+
+这意味着：
+- 单项计算：先除以 5，保留 `$decimals` 位小数，再乘以 5
+- 最终汇总：先除以 5，**保留 0 位小数**（即整数），再乘以 5
+
+**数值差异示例**（设 `decimals = 2`）：
+
+| 待舍入值 | 单项计算结果（decimals=2） | 最终汇总结果（decimals=0） | 差异 |
+|---------|--------------------------|--------------------------|------|
+| 12.34 | round(2.468, 2, HALF_EVEN) * 5 = 2.47 * 5 = 12.35 | round(2.468) * 5 = 2 * 5 = 10.00 | 差 2.35 |
+| 10.10 | round(2.02, 2, HALF_EVEN) * 5 = 2.02 * 5 = 10.10 | round(2.02) * 5 = 2 * 5 = 10.00 | 差 0.10 |
+
+最终汇总的 HALF_FIVE 实现实际上是"舍入到最近的 5 的整数倍"，而非"舍入到指定小数位后再对齐 5 的倍数"。
+
+#### 7.6.3 差异二：舍入模式
+
+**单项计算**：使用 `Rounding_mode::HALF_EVEN` 作为内部舍入模式
+**最终汇总**：使用 PHP `round()` 的默认模式 `PHP_ROUND_HALF_UP`
+
+当除以 5 后的值恰好处于 0.5 边界时，两处行为不同：
+
+| 待舍入值 | 除以 5 后 | 单项（HALF_EVEN） | 最终（HALF_UP） |
+|---------|----------|------------------|----------------|
+| 12.50 | 2.5 | 2（偶数） → 10.00 | 3（四舍五入） → 15.00 |
+| 7.50 | 1.5 | 2（偶数） → 10.00 | 2（四舍五入） → 10.00 |
+| 17.50 | 3.5 | 4（偶数） → 20.00 | 4（四舍五入） → 20.00 |
+
+当除以 5 后的整数部分为奇数且小数部分恰好为 0.5 时，两处结果会不同。
+
+#### 7.6.4 差异三：输入类型与精度传播
+
+- 单项计算中，`$amount` 是 `float` 类型（`get_tax_for_amount` 中 bcmul 的结果为字符串，经隐式转换传入）
+- 最终汇总中，`$tax_amount` 是通过 `bcadd(..., 4)` 累加的字符串，转换为 float 后参与计算
+
+在极端精度场景下，浮点精度可能引入额外差异，但这不是主要差异来源。
+
+### 7.7 舍入不一致性的影响范围
+
+| 舍入模式 | 基础税制 | 目的地税制 |
+|---------|---------|-----------|
+| HALF_UP | 一致（都用 HALF_UP） | 一致 |
+| HALF_DOWN | 不涉及 | 一致（都用 PHP 原生 round） |
+| HALF_EVEN | 不涉及 | 一致（都用 PHP 原生 round） |
+| **HALF_ODD** | 不涉及 | **不一致**（汇总处用了 HALF_UP） |
+| ROUND_UP | 不涉及 | 基本一致（实现思路相同，写法略有差异） |
+| ROUND_DOWN | 不涉及 | 基本一致 |
+| **HALF_FIVE** | 不涉及 | **不一致**（小数位、舍入模式均不同） |
+
+> **注意**：`apply_invoice_taxing()` 方法调用的是 `get_tax_for_amount()`，因此与单项计算使用同一套实现。但该方法目前仅用于数据迁移，不影响正常销售流程。
+
 ---
 
 ## 8. 税种分组与显示顺序
