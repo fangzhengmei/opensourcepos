@@ -398,10 +398,13 @@ bcscale(max(2, totals_decimals() + tax_decimals()));
 
 税费计算中存在**两套独立的舍入实现**，分别服务于不同的计算阶段：
 
-| 阶段 | 调用路径 | 实现函数 | 适用场景 |
-|------|---------|---------|---------|
-| 单项税额计算 | `get_tax_for_amount()` | [Rounding_mode::round_number()](file:///d:/fz/0601-1/solo-dogfeeding/code/17-opensourcepos/app/Models/Enums/Rounding_mode.php#L70-L85) | 目的地税制下，每个商品每个税种的单项税额计算 |
-| 最终汇总舍入 | `round_taxes()` | [Tax_lib::round_taxes()](file:///d:/fz/0601-1/solo-dogfeeding/code/17-opensourcepos/app/Libraries/Tax_lib.php#L252-L294) | 按税种分组累加后，对总税额做最终舍入 |
+| 阶段 | 入口函数 | 舍入实现 | 覆盖税种 | 适用场景 |
+|------|---------|---------|---------|---------|
+| 单项税额计算 | [get_tax_for_amount()](file:///d:/fz/0601-1/solo-dogfeeding/code/17-opensourcepos/app/Libraries/Tax_lib.php#L76-L81) | [Rounding_mode::round_number()](file:///d:/fz/0601-1/solo-dogfeeding/code/17-opensourcepos/app/Models/Enums/Rounding_mode.php#L70-L85) | **仅价外税** | 价外税种的单项税额计算 |
+| 单项税额计算 | [get_included_tax()](file:///d:/fz/0601-1/solo-dogfeeding/code/17-opensourcepos/app/Libraries/Tax_lib.php#L183-L189) | 无（`$tax_decimal`、`$rounding_code` 未使用） | **仅价内税** | 价内税种的单项税额计算（不做舍入） |
+| 最终汇总舍入 | [round_taxes()](file:///d:/fz/0601-1/solo-dogfeeding/code/17-opensourcepos/app/Libraries/Tax_lib.php#L252-L294) | 内联 if-elseif | 价内 + 价外 | 按税种分组累加后，对总税额做最终舍入 |
+
+> **关键区分**：单项阶段有**两个**互斥的入口函数，价外税走 `get_tax_for_amount()`，价内税走 `get_included_tax()`。HALF_ODD 和 HALF_FIVE 的舍入逻辑**只存在于 `get_tax_for_amount()` 的调用链**中（即 `Rounding_mode::round_number()`），价内税的单项路径**完全不经过该函数**，因此这些舍入模式在价内税单项阶段永远不会生效。
 
 > **注意**：基础税制下两处都硬编码为 `HALF_UP`，因此不存在不一致问题。仅**目的地税制**下会触发 `tax_rates.tax_rounding_code` 配置的其他舍入模式。
 
@@ -506,6 +509,151 @@ bcscale(max(2, totals_decimals() + tax_decimals()));
 | **HALF_FIVE** | 不涉及 | **不一致**（小数位、舍入模式均不同） |
 
 > **注意**：`apply_invoice_taxing()` 方法调用的是 `get_tax_for_amount()`，因此与单项计算使用同一套实现。但该方法目前仅用于数据迁移，不影响正常销售流程。
+
+### 7.8 价内税与价外税的舍入逻辑差异
+
+#### 7.8.1 代码证据：`get_included_tax()` 的参数未使用问题
+
+价内税计算函数 [Tax_lib::get_included_tax()](file:///d:/fz/0601-1/solo-dogfeeding/code/17-opensourcepos/app/Libraries/Tax_lib.php#L183-L189) 有一个明确的代码注释：
+
+```php
+// TODO: $tax_decimal and $rounding_code are in the signature but never used in the function.
+public function get_included_tax(string $quantity, string $price, string $discount_percentage, int $discount_type, string $tax_percentage, $tax_decimal, $rounding_code): string
+{
+    $item_total = $this->sale_lib->get_item_total($quantity, $price, $discount_percentage, $discount_type, true);
+    $tax_fraction = bcdiv(bcadd('100', $tax_percentage), '100');
+    $price_tax_excl = bcdiv($item_total, $tax_fraction);
+    return bcsub($item_total, $price_tax_excl);
+}
+```
+
+函数体内完全没有使用 `$tax_decimal` 和 `$rounding_code` 两个参数，也没有调用任何舍入函数。返回值是 `bcsub` 的高精度运算结果，精度由全局 `bcscale()` 决定。
+
+对比价外税计算函数 [Tax_lib::get_tax_for_amount()](file:///d:/fz/0601-1/solo-dogfeeding/code/17-opensourcepos/app/Libraries/Tax_lib.php#L76-L81)：
+
+```php
+public function get_tax_for_amount(string $tax_basis, string $tax_percentage, int $rounding_mode, int $decimals): string
+{
+    $tax_amount = bcmul($tax_basis, bcdiv($tax_percentage, '100'));
+    return rounding_mode::round_number($rounding_mode, $tax_amount, $decimals);
+}
+```
+
+明确调用了 `round_number()` 做单项舍入，参数 `$rounding_mode` 和 `$decimals` 都被使用。
+
+#### 7.8.2 两种税制下的舍入路径对比
+
+##### 基础税制（`use_destination_based_tax = false`）
+
+| 维度 | 价内税（`tax_included = true`） | 价外税（`tax_included = false`） |
+|------|-------------------------------|-------------------------------|
+| 舍入模式 | 硬编码 `HALF_UP`（但未使用） | 硬编码 `HALF_UP` |
+| 单项舍入 | ❌ 无 | ✅ 按 `tax_decimals` 舍入 |
+| 最终舍入精度 | `tax_decimals` | `currency_decimals` |
+| 最终舍入模式 | `HALF_UP`（round_taxes 中） | `HALF_UP`（round_taxes 中） |
+
+调用链见 [Tax_lib::get_taxes()](file:///d:/fz/0601-1/solo-dogfeeding/code/17-opensourcepos/app/Libraries/Tax_lib.php#L118-L124)：
+
+```php
+if ($this->config['tax_included']) {
+    $tax_type = Tax_lib::TAX_TYPE_INCLUDED;
+    $tax_amount = $this->get_included_tax(..., $tax_decimals, Rounding_mode::HALF_UP);
+} else {
+    $tax_type = Tax_lib::TAX_TYPE_EXCLUDED;
+    $tax_amount = $this->get_tax_for_amount($tax_basis, $tax['percent'], Rounding_mode::HALF_UP, $tax_decimals);
+}
+```
+
+> 注意：基础税制下 `rounding_code` 全部硬编码为 `HALF_UP`，因此 HALF_ODD、HALF_FIVE 等模式在此处**不会触发**，不存在不一致问题。
+
+##### 目的地税制（`use_destination_based_tax = true`）
+
+| 维度 | 价内税（`tax_type = '0'`） | 价外税（`tax_type = '1'`） |
+|------|---------------------------|---------------------------|
+| 舍入模式来源 | `tax_rates.tax_rounding_code`（但单项阶段未使用） | `tax_rates.tax_rounding_code` |
+| 单项舍入 | ❌ 无（参数传递了但未使用） | ✅ 按 `tax_decimals` 舍入，触发 HALF_ODD/HALF_FIVE |
+| 最终舍入精度 | 由全局 `tax_included` 配置决定，**而非税种自身的 tax_type** | 由全局 `tax_included` 配置决定 |
+| 最终舍入模式 | `tax_rates.tax_rounding_code`（触发 round_taxes 中的另一套实现） | `tax_rates.tax_rounding_code`（触发 round_taxes 中的另一套实现） |
+
+调用链见 [Tax_lib::apply_destination_tax()](file:///d:/fz/0601-1/solo-dogfeeding/code/17-opensourcepos/app/Libraries/Tax_lib.php#L333-L338)：
+
+```php
+if ($tax_type == Tax_lib::TAX_TYPE_INCLUDED) {
+    $tax_amount = $this->get_included_tax($item['quantity'], $item['price'], $item['discount'], $item['discount_type'], $tax_rate, $tax_decimals, $rounding_code);
+} else {
+    $tax_amount = $this->get_tax_for_amount($tax_basis, $tax_rate, $rounding_code, $tax_decimals);
+    $cascade_tax_amount = bcadd($cascade_tax_amount, $tax_amount);
+}
+```
+
+#### 7.8.3 为什么会有这种差异？——设计意图推测
+
+价内税（VAT）与价外税（Sales Tax）的计税逻辑有本质区别：
+
+1. **价外税**：税额 = 税基 × 税率，结果可能有无限小数，需要明确的舍入规则来确定每笔交易的应税金额。不同国家/地区对税额舍入有明确的法律规定（如 HALF_UP、HALF_EVEN 等）。
+
+2. **价内税**：商品标价已经包含税额，税额 = 含税总价 − 不含税价格。由于含税总价是"整数金额"（顾客实际支付的金额），反推的不含税价格本身就由业务逻辑决定了精度，**不应该在单项层面做舍入**，否则会导致"反推税额相加 ≠ 总税额"的数学矛盾。
+
+举例说明价内税单项舍入的风险：
+
+```
+假设税率 13%，两个商品各售 100 元（含税）
+
+商品 1：不含税价 = 100 / 1.13 = 88.4955...，税额 = 11.5044...
+商品 2：不含税价 = 100 / 1.13 = 88.4955...，税额 = 11.5044...
+
+如果单项按 2 位小数舍入：
+  商品 1 税额舍入后 = 11.50
+  商品 2 税额舍入后 = 11.50
+  税额合计 = 23.00
+
+但实际总税额应该是：
+  总价 200 / 1.13 = 176.9911...（不含税）
+  总税额 = 200 − 176.99 = 23.01
+
+❌ 出现 0.01 元的差异！
+```
+
+**正确的做法**：先汇总所有含税总价，再统一反推税额。这就是价内税不在单项层面做舍入的设计原因。
+
+#### 7.8.4 关于矛盾描述的澄清
+
+之前的"每个商品都会根据 tax_decimals 进行舍入"的描述**只适用于价外税**。完整的准确表述应该是：
+
+- **价外税**：每个商品的每个税种先按 `tax_decimals` 做单项舍入，然后按税种分组累加（4 位小数精度），最后按 `currency_decimals` 做最终舍入——**两次舍入**
+- **价内税**：每个商品的税额直接以高精度（`bcscale` 决定）累加，汇总后再按 `tax_decimals` 做最终舍入——**仅一次舍入**
+
+#### 7.8.5 额外的潜在问题：最终舍入精度的判定
+
+最终舍入精度的判定逻辑见 [Tax_lib::round_taxes()](file:///d:/fz/0601-1/solo-dogfeeding/code/17-opensourcepos/app/Libraries/Tax_lib.php#L263-L267)：
+
+```php
+if ($this->config['tax_included']) {
+    $decimals = tax_decimals();
+} else {
+    $decimals = totals_decimals();
+}
+```
+
+此处使用的是**全局配置** `$this->config['tax_included']`，而非每个税种自身的 `tax_type`。这在目的地税制下可能存在问题：
+
+如果同一笔销售中同时存在价内税种和价外税种（不同辖区配置了不同的 `tax_type`），那么所有税种的最终舍入精度将由全局配置统一决定，而非根据税种自身类型区分。这可能导致：
+
+- 全局 `tax_included = true` 时，价外税也按 `tax_decimals` 舍入
+- 全局 `tax_included = false` 时，价内税也按 `currency_decimals` 舍入
+
+不过这个问题在实际场景中影响有限，因为企业通常不会在同一销售中混合使用价内税和价外税两种征管模式。
+
+#### 7.8.6 数值对比示例
+
+设 `tax_decimals = 4`，`currency_decimals = 2`，`rounding_code = HALF_FIVE`，税率 13%：
+
+| 场景 | 商品 1 税额 | 商品 2 税额 | 单项舍入后合计 | 先合计后舍入 | 差异 |
+|------|-----------|-----------|--------------|------------|------|
+| 价外税（两次舍入） | 1.3000 → 0（HALF_FIVE 到 5 的倍数） | 1.3000 → 0 | 0.00 | 2.60 → 5.00 | **5.00** |
+| 价内税（一次舍入） | 1.1504（无单项舍入） | 1.1504（无单项舍入） | — | 2.3008 → 0 | **0.00** |
+
+> 注：此示例为极端情况，用于展示舍入路径差异。实际业务中 HALF_FIVE 通常用于特殊现金舍入场景。
 
 ---
 
