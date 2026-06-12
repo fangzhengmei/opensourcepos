@@ -428,47 +428,98 @@ $this->mailchimp_lib->addOrUpdateMember(
 - `$this->_list_id`：从配置 `mailchimp_list_id` 解密获取（[Customers.php L36-L39](file:///d:/fz/0601-1/solo-dogfeeding/code/18-opensourcepos/app/Controllers/Customers.php#L36-L39)）
 - API Key：从配置 `mailchimp_api_key` 解密获取（[Mailchimp_lib.php L45-L52](file:///d:/fz/0601-1/solo-dogfeeding/code/18-opensourcepos/app/Libraries/Mailchimp_lib.php#L45-L52)）
 
-### 9.4 列表 ID 为空时的请求流程
+### 9.4 API Key 与 List ID 为空时的请求流程
 
-**⚠️ 容易疏漏：双重静默失败路径**
+**⚠️ 核心事实：`call()` 方法只在入口处检查 `_api_key`，不检查 `list_id`**
 
-当 `mailchimp_list_id` 配置为空时，同步过程涉及三层失败路径，每层都可能静默跳过：
+两种配置缺失的静默失败路径完全不同，但最终都返回 `false`，调用方无法区分。
+
+#### 9.4.1 场景一：API Key 为空（最先拦截，不发请求）
 
 ```
-控制器构造函数 → $this->_list_id = ''（[Customers.php L38-L39](file:///d:/fz/0601-1/solo-dogfeeding/code/18-opensourcepos/app/Controllers/Customers.php#L38-L39)）
+MailchimpConnector 构造函数
     ↓
-addOrUpdateMember('', $email, ...)  // 传入空 list_id
+mailchimp_api_key 配置为空 → $this->_api_key 保持 ''（[Mailchimp_lib.php L45-L53](file:///d:/fz/0601-1/solo-dogfeeding/code/18-opensourcepos/app/Libraries/Mailchimp_lib.php#L45-L53)）
     ↓
-call("/lists//members/{md5}", 'PUT', $args)  // URL 变成 /lists//members/xxx
+_api_endpoint 中的 <dc> 占位符未被替换（[Mailchimp_lib.php L55-L61](file:///d:/fz/0601-1/solo-dogfeeding/code/18-opensourcepos/app/Libraries/Mailchimp_lib.php#L55-L61)）
     ↓
-_request() → curl_exec → Mailchimp API 返回 404/400 → json_decode 返回 false
+addOrUpdateMember() → 拼接 $parameters → 调用 $this->_connector->call()
     ↓
-call() 返回 false
+call() 入口：if (!empty($this->_api_key)) → false（[Mailchimp_lib.php L73](file:///d:/fz/0601-1/solo-dogfeeding/code/18-opensourcepos/app/Libraries/Mailchimp_lib.php#L73)）
+    ↓
+直接 return false（[Mailchimp_lib.php L77](file:///d:/fz/0601-1/solo-dogfeeding/code/18-opensourcepos/app/Libraries/Mailchimp_lib.php#L77)）
+    ↓
+❌ 不发出任何 HTTP 请求
     ↓
 控制器忽略返回值 → 完全静默
 ```
 
-**更隐蔽的情况：API Key 为空但 List ID 存在**
+**关键细节：** API Key 为空时，`_api_endpoint` 的 `<dc>` 占位符**未被替换**（[L55-L61](file:///d:/fz/0601-1/solo-dogfeeding/code/18-opensourcepos/app/Libraries/Mailchimp_lib.php#L55-L61)），endpoint 仍为 `https://<dc>.api.mailchimp.com/3.0/`。但这一点无关紧要，因为 `call()` 在 L73 就直接返回了，`_request()` 不会被调用。
+
+#### 9.4.2 场景二：API Key 存在但 List ID 为空（发出无效请求）
 
 ```
-MailchimpConnector 构造函数 → $this->_api_key = ''（[Mailchimp_lib.php L45-L53](file:///d:/fz/0601-1/solo-dogfeeding/code/18-opensourcepos/app/Libraries/Mailchimp_lib.php#L45-L53)）
+Customers 控制器构造函数
     ↓
-call() 方法检查 if (!empty($this->_api_key)) → 不通过
+mailchimp_list_id 配置为空 → $this->_list_id = ''（[Customers.php L38-L39](file:///d:/fz/0601-1/solo-dogfeeding/code/18-opensourcepos/app/Controllers/Customers.php#L38-L39)）
     ↓
-直接 return false（[Mailchimp_lib.php L77](file:///d:/fz/0601-1/solo-dogfeeding/code/18-opensourcepos/app/Libraries/Mailchimp_lib.php#L77)）
+addOrUpdateMember('', $email, $first_name, '', $last_name)
     ↓
-连 HTTP 请求都不会发出，更早地静默失败
+拼接 $parameters → 调用 $this->_connector->call("/lists//members/{md5(email)}", 'PUT', $args)
+    ↓                                                          ↑
+    ↓                                              空字符串拼接为 /lists//members/...
+    ↓
+call() 入口：if (!empty($this->_api_key)) → true ✅（API Key 存在，通过检查）
+    ↓
+进入 _request()
+    ↓
+_build_request_url() → URL = "https://us1.api.mailchimp.com/3.0/lists//members/{md5}"
+    ↓                                              ↑
+    ↓                                  路径中出现连续双斜杠
+    ↓
+curl_exec() → 发出真实 HTTP 请求
+    ↓
+Mailchimp API 返回 404 或 400 → $result 非空但非合法 JSON
+    ↓
+json_decode($result, true) → 返回包含 'status'/'detail' 的错误数组，或解析失败返回 null
+    ↓
+L124: return $result ? json_decode($result, true) : false
+    ↓
+⚠️ 此处 curl_exec 通常返回非空字符串（HTTP 错误响应体），所以 $result 为 true
+    ↓
+返回的是 Mailchimp 的错误详情数组（如 ['status' => 404, 'detail' => '...']），而非 false
+    ↓
+控制器忽略返回值 → 完全静默
 ```
 
-**三层失败静默点汇总：**
+**⚠️ 重大疏漏：List ID 为空时，返回值不是 `false`，而是 Mailchimp 的错误详情数组**
 
-| 失败层级 | 检查位置 | 触发条件 | 是否发请求 | 可观测性 |
-|---------|---------|---------|-----------|---------|
-| 第1层：API Key 为空 | [Mailchimp_lib.php L73](file:///d:/fz/0601-1/solo-dogfeeding/code/18-opensourcepos/app/Libraries/Mailchimp_lib.php#L73) | `mailchimp_api_key` 配置为空 | ❌ 不发 | 完全不可见 |
-| 第2层：List ID 为空 | 无检查，直接拼接 URL | `mailchimp_list_id` 配置为空 | ✅ 发送到无效路径 | 需抓包才能发现 |
-| 第3层：API 返回错误 | [Mailchimp_lib.php L124](file:///d:/fz/0601-1/solo-dogfeeding/code/18-opensourcepos/app/Libraries/Mailchimp_lib.php#L124) | status/参数等不合法 | ✅ 正常发送 | 返回 false，无日志 |
+代码 L124 是 `$result ? json_decode($result, true) : false`。`curl_exec` 在 HTTP 错误时仍返回响应体（非空字符串），所以 `$result` 为 truthy，最终 `json_decode` 返回的是一个**包含错误信息的关联数组**，而非 `false`。这与 9.6 节"返回 `false`"的说法不一致。
 
-> **注意：** 第2层（List ID 为空）时，虽然会发送 HTTP 请求，但 URL 是 `/lists//members/...`，Mailchimp API 可能返回 404 或 400，最终都被静默转为 `false`，调用方无从得知具体原因。
+实际返回值示例：
+```php
+['type' => '...', 'title' => 'Resource Not Found', 'status' => 404, 'detail' => '...']
+```
+
+#### 9.4.3 两种场景的精确对比
+
+| 维度 | API Key 为空 | List ID 为空 |
+|-----|-------------|-------------|
+| 拦截位置 | [Mailchimp_lib.php L73](file:///d:/fz/0601-1/solo-dogfeeding/code/18-opensourcepos/app/Libraries/Mailchimp_lib.php#L73) `call()` 入口守卫 | 无拦截，直接进入 `_request()` |
+| 是否发 HTTP 请求 | ❌ 不发 | ✅ 发送到畸形 URL |
+| 实际返回值 | `false`（布尔值） | **Mailchimp 错误详情数组**（非 `false`） |
+| 调用方可区分性 | 无法区分"未配置"和"网络错误" | 返回值中包含 `status`、`detail` 等错误信息，**理论上可区分**，但代码未检查 |
+| `_api_endpoint` 状态 | `<dc>` 占位符未替换（但不会被使用） | `<dc>` 已正确替换为实际数据中心 |
+
+#### 9.4.4 更正后的三层失败静默点汇总
+
+| 失败层级 | 检查位置 | 触发条件 | 是否发请求 | 返回值 | 可观测性 |
+|---------|---------|---------|-----------|-------|---------|
+| 第1层：API Key 为空 | [Mailchimp_lib.php L73](file:///d:/fz/0601-1/solo-dogfeeding/code/18-opensourcepos/app/Libraries/Mailchimp_lib.php#L73) `call()` | `mailchimp_api_key` 配置为空 | ❌ | `false` | 完全不可见 |
+| 第2层：List ID 为空 | 无检查 | `mailchimp_list_id` 配置为空 | ✅ 发送到畸形 URL | **错误详情数组**（非 `false`） | 返回值含错误信息，但未被检查 |
+| 第3层：API 返回错误 | [Mailchimp_lib.php L119-L124](file:///d:/fz/0601-1/solo-dogfeeding/code/18-opensourcepos/app/Libraries/Mailchimp_lib.php#L119-L124) | 参数错位等导致 API 校验失败 | ✅ 正常发送 | **错误详情数组** | 返回值含错误信息，但未被检查 |
+
+> **纠正：** 之前文档将第 2、3 层的返回值统一描述为 `false`，实际上 `curl_exec` 在 HTTP 4xx/5xx 时仍返回响应体，`$result` 为 truthy，`json_decode` 返回的是包含 `status`/`detail` 的关联数组。仅当 `curl_exec` 本身失败（如网络超时、DNS 解析失败）时才返回 `false`。
 
 ### 9.5 CSV 导入与手动表单的参数差异
 
@@ -529,7 +580,8 @@ $parameters += [
 
 - `addOrUpdateMember()` 返回值**未被检查**，Mailchimp 同步失败不影响客户保存结果
 - 没有错误日志、没有重试机制
-- 如果 Mailchimp 未配置（API Key 或 List ID 为空），API 调用直接返回 `false`，同样静默忽略（见 [Mailchimp_lib.php L71-L78](file:///d:/fz/0601-1/solo-dogfeeding/code/18-opensourcepos/app/Libraries/Mailchimp_lib.php#L71-L78)）
+- **API Key 为空时**：`call()` 方法入口处直接返回 `false`，连 HTTP 请求都不会发出（见 [Mailchimp_lib.php L73-L77](file:///d:/fz/0601-1/solo-dogfeeding/code/18-opensourcepos/app/Libraries/Mailchimp_lib.php#L73-L77)）
+- **List ID 为空时**：`call()` 方法**不校验 list_id**，会正常发送 HTTP 请求，但 URL 路径畸形（`/lists//members/...`），Mailchimp API 返回错误后被静默转为 `false`，调用方无法区分是网络错误还是参数错误
 - 同步失败不会导致客户导入回滚，数据一致性完全依赖外部人工检查
 
 ---
@@ -567,6 +619,15 @@ $parameters += [
 18. **属性 `_DELETE_` 标记**：仅商品导入支持，客户导入无此机制
 19. **Mailchimp 参数错位**：CSV 导入路径的 `addOrUpdateMember()` 调用中 `last_name` 和 `status` 参数错位，导致姓氏丢失、订阅状态异常
 20. **同步结果未检查**：Mailchimp 同步失败完全静默，无日志无提示
+
+### 10.5 Mailchimp 同步专项遗漏点
+
+21. **API Key 与 List ID 静默失败环节不同**：API Key 为空在 `call()` 方法入口直接返回 `false`，**不发请求**；List ID 为空会**正常发请求**到畸形 URL，最终 API 返回错误被静默转为 `false`。两者虽然都返回 `false`，但内部路径完全不同
+22. **`call()` 只校验 api_key，不校验 list_id**：[Mailchimp_lib.php L73](file:///d:/fz/0601-1/solo-dogfeeding/code/18-opensourcepos/app/Libraries/Mailchimp_lib.php#L73) 只有 `!empty($this->_api_key)` 检查，List ID 的合法性完全交由调用方保证
+23. **`status_if_new` 隐藏兜底掩盖参数 Bug**：即使 `status` 参数传错（如传了姓氏），新成员仍可能因 `status_if_new = 'subscribed'` 而被正确订阅，掩盖了参数错位问题
+24. **VIP 参数在 CSV 导入路径缺失**：手动表单有 `mailchimp_vip` 复选框，CSV 导入未传第 6 个参数，两种路径创建的客户在 Mailchimp 中的 VIP 标记不一致
+25. **`$parameters +=` 差集合并机制**：调用方传入的键保留、缺的键补默认值，理解此机制才能正确扩展自定义字段同步
+26. **同步失败不回滚客户数据**：客户已写入数据库但 Mailchimp 同步失败时，不会回滚客户记录，两边数据不一致只能人工排查
 
 ---
 
@@ -607,3 +668,19 @@ $parameters += [
 ### 11.9 统一 taxable 默认值
 
 控制器空值默认值（0）与数据库 DEFAULT（1）应保持一致，避免数据语义偏差。
+
+### 11.10 Mailchimp 同步前置校验
+
+在调用 `addOrUpdateMember()` 之前，检查 `$this->_list_id` 是否为空，空则直接跳过并记录日志，避免发送无效请求。
+
+### 11.11 同步失败可观测
+
+检查 `addOrUpdateMember()` 返回值，失败时记录日志或向前端返回警告，至少让用户知道同步未成功。
+
+### 11.12 CSV 导入增加 Mailchimp 列
+
+在 CSV 模板中增加 `Mailchimp Status` 和 `Mailchimp VIP` 两列，与手动表单功能对齐，避免两种导入路径的数据不一致。
+
+### 11.13 统一参数传递方式
+
+重构 `addOrUpdateMember()` 参数列表，使用数组或对象传参，降低参数顺序错位风险。
