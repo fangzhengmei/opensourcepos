@@ -861,65 +861,106 @@ private function migrate_table(string $ci3_migrations_version): void
 
 ---
 
-## 八、AJAX 迁移成功后的页面处理：两条代码路径对比
+## 八、AJAX 迁移成功后的页面处理：同页、下请求与回滚重算
 
-OSPOS 有两条触发迁移的代码路径，它们在"同页显示"和"下请求生效"上的行为完全不同。
+### 8.1 两条迁移入口与 JS 分流逻辑
 
-### 8.1 两条入口的代码路径
+OSPOS 有两条触发迁移的代码路径，由前端 JS 根据 `APP_STATE.isNewInstall` 分流。
 
-#### 路径 A：非全新安装的 POST 提交（旧升级方式）
-
-[Login::index()](file:///d:/fz/0601-1/solo-dogfeeding/code/20-opensourcepos/app/Controllers/Login.php#L48-L57)
-
-```php
-// 非最新版本 + 非 GET → 执行迁移
-if (!$data['is_latest'] || $data['is_new_install']) {
-    set_time_limit(3600);
-    $migration->setNamespace('App')->latest();
-    return redirect()->to('login');  // ← 服务端 302 重定向，浏览器发新 GET 请求
-}
-```
-
-**请求链**：
-```
-POST /login (提交登录表单)
-  ├─ 服务端执行 latest()
-  ├─ 成功 → 302 redirect → GET /login（新请求）
-  └─ 失败 → 抛异常，PHP 致命错误白屏
-```
-
-**特点**：
-- 无论成功/失败都**不做页面局部更新**
-- 成功后由浏览器发起新 GET 请求，自然重新加载配置
-- 失败时**无优雅处理**，用户看到白屏或 CI4 错误页
-
-#### 路径 B：全新安装的 AJAX 调用（当前主流方式）
+#### 分流逻辑
 
 [login.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-opensourcepos/app/Views/login.php#L257-L288)
 
 ```javascript
 $form.on('submit', function(e) {
-    if (APP_STATE.isNewInstall) {
-        e.preventDefault();
-        showMigrationProgress();
-
-        $.ajax({
-            url: APP_STATE.migrateUrl,   // POST /migrate
-            timeout: 3600000,            // 1 小时超时
-            success: function(response) {
-                if (response.success) {
-                    APP_STATE.isNewInstall = false;  // ← 关键：只改了 JS 变量
-                    showMigrationSuccess();           // ← 同页显示成功提示
-                } else {
-                    showMigrationError(response.message);
-                }
-            },
-            error: function(xhr) {
-                showMigrationError(message);
-            }
-        });
+    if (APP_STATE.isNewInstall) {   // ← 分流点
+        e.preventDefault();         // 阻止表单提交
+        // ... AJAX 调用 /migrate
     }
+    // APP_STATE.isNewInstall = false 时，不拦截 → 表单正常 POST /login
 });
+```
+
+`APP_STATE.isNewInstall` 的值由 PHP 模板注入：
+
+[login.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-opensourcepos/app/Views/login.php#L171)
+
+```javascript
+isNewInstall: <?= $is_new_install ? 'true' : 'false' ?>,
+```
+
+`$is_new_install` 来自 [Login::index()](file:///d:/fz/0601-1/solo-dogfeeding/code/20-opensourcepos/app/Controllers/Login.php#L40)：
+
+```php
+$is_new_install = !(MY_Migration::get_current_version());
+// 数据库 migrations 表为空或不存在 → true（全新安装）
+// 数据库有迁移记录 → false（升级场景）
+```
+
+**因此两条路径的区分**：
+- **全新安装**：`is_new_install = true` → JS 拦截表单 → AJAX POST `/migrate`
+- **升级场景**：`is_new_install = false` → JS 不拦截 → 表单 POST `/login`
+
+> 注意：升级场景虽然 `is_latest = false`，但 `is_new_install = false`，
+> 所以 JS **不拦截**表单提交，走的是 `Login::index()` 中的 POST 分支。
+
+### 8.2 路径 A：升级场景 — 表单 POST `/login`
+
+[Login::index()](file:///d:/fz/0601-1/solo-dogfeeding/code/20-opensourcepos/app/Controllers/Login.php#L48-L57)
+
+```php
+if ($this->request->getMethod() !== 'POST') {
+    return view('login', $data);  // GET → 显示登录页
+}
+
+if (!$data['is_latest'] || $data['is_new_install']) {
+    set_time_limit(3600);
+    $migration->setNamespace('App')->latest();
+    return redirect()->to('login');  // 302 重定向 → 新 GET 请求
+}
+```
+
+**完整请求链**：
+
+```
+1. GET /login           → 渲染页面，显示升级提示
+2. POST /login（登录）   → 服务端执行 latest()
+   ├─ 成功 → 302 redirect → GET /login → 新请求，全新加载配置
+   └─ 失败 → 抛异常，PHP 白屏（无优雅处理）
+3. GET /login（重定向后）→ is_latest=true → 显示登录表单
+```
+
+**特点**：
+- 迁移成功后由 `redirect()->to('login')` 触发浏览器 302 跳转
+- 新的 GET 请求中 OSPOS 实例重新创建，配置从缓存/数据库重新加载
+- ✅ **不存在同页旧配置问题**，因为页面完全刷新
+
+### 8.3 路径 B：全新安装 — AJAX POST `/migrate`
+
+[login.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-opensourcepos/app/Views/login.php#L257-L288)
+
+```javascript
+if (APP_STATE.isNewInstall) {
+    e.preventDefault();
+    showMigrationProgress();
+
+    $.ajax({
+        url: APP_STATE.migrateUrl,   // POST /migrate
+        timeout: 3600000,
+        data: { [APP_STATE.csrfToken]: APP_STATE.csrfHash },
+        success: function(response) {
+            if (response.success) {
+                APP_STATE.isNewInstall = false;   // ← 改 JS 状态变量
+                showMigrationSuccess();            // ← 同页 DOM 操作
+            } else {
+                showMigrationError(response.message);
+            }
+        },
+        error: function(xhr) {
+            showMigrationError(message);
+        }
+    });
+}
 ```
 
 [Login::migrate()](file:///d:/fz/0601-1/solo-dogfeeding/code/20-opensourcepos/app/Controllers/Login.php#L77-L99)
@@ -939,90 +980,178 @@ public function migrate(): ResponseInterface
 }
 ```
 
-**请求链**：
+**完整请求链**：
+
 ```
-AJAX POST /migrate
-  ├─ 服务端执行 latest()
-  ├─ 成功 → 200 JSON {success: true}
-  │   └─ 前端 JS:
-  │       ├─ APP_STATE.isNewInstall = false
-  │       ├─ showMigrationSuccess() → 显示成功提示 + 登录表单
-  │       └─ ⚠️ 页面不刷新，仍在原 DOM 上操作
-  └─ 失败 → 500 JSON {success: false, message: "..."}
-      └─ 前端 JS:
-          ├─ showMigrationError(message) → 显示错误提示 + 重试按钮
-          └─ ⚠️ 页面不刷新，用户可再次点击迁移
+1. GET /login           → 渲染页面，is_new_install=true，显示"迁移"按钮
+2. 点击"迁移" → AJAX POST /migrate
+   ├─ 成功 → JSON {success:true} → showMigrationSuccess()（同页 DOM 操作）
+   └─ 失败 → JSON {success:false} → showMigrationError()（同页 DOM 操作）
+3. 用户输入密码，点击"Go" → 表单正常 POST /login
+   （APP_STATE.isNewInstall 已被改为 false，JS 不再拦截）
+4. POST /login → is_latest=true → 验证登录 → redirect→home
 ```
 
-### 8.2 同页显示：AJAX 成功后页面上的配置值是旧的
+### 8.4 同页不刷新的精确分析
 
-**核心问题**：AJAX 成功后 `showMigrationSuccess()` 只做了 DOM 操作，**没有刷新页面**。
+**`showMigrationSuccess()` 做了什么**：
 
-[login.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-opensourcepos/app/Views/login.php#L221-L230) 中的 `showMigrationSuccess()`：
+[login.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-opensourcepos/app/Views/login.php#L221-L230)
+
 ```javascript
 function showMigrationSuccess() {
-    $progress.addClass('d-none');
-    $error.addClass('d-none');
-    $warning.addClass('d-none');
-    $success.removeClass('d-none');     // 显示 "迁移完成" 提示
-    $heading.text(APP_STATE.i18n.welcome); // 标题改为 "欢迎"
-    $loginFields.removeClass('d-none');    // 显示登录表单
-    $submitButton.text(APP_STATE.i18n.go); // 按钮文字改为 "Go"
+    $progress.addClass('d-none');        // 隐藏进度条
+    $error.addClass('d-none');           // 隐藏错误框
+    $warning.addClass('d-none');         // 隐藏升级提示
+    $success.removeClass('d-none');      // 显示"迁移完成"提示
+    $heading.text(APP_STATE.i18n.welcome);  // 标题改为 "欢迎"
+    $loginFields.removeClass('d-none');  // 显示登录表单
+    $submitButton.text(APP_STATE.i18n.go);  // 按钮文字改为 "Go"
     $submitButton.prop('disabled', false);
 }
 ```
 
-**此时页面上哪些配置值可能是旧的？**
+**页面没有刷新**，但理解"旧 DOM"的影响需要区分两层：
 
-页面初始渲染时由 PHP 输出的配置值，在 AJAX 成功后**仍然留在 DOM 中**：
+#### 第一层：PHP 硬编码到 HTML 的配置值（确实没更新）
 
-| DOM 元素 | 来源 | 初始值 | AJAX 后是否更新 |
-|----------|------|--------|-----------------|
-| `<html lang="...">` | PHP `current_language_code()` → 依赖 `config(OSPOS::class)->settings` | 旧语言代码 | ❌ 不更新 |
-| `<title>` | PHP `$config['company']` | 旧公司名 | ❌ 不更新 |
-| 主题 CSS `<link>` | PHP `$config['theme']` | 旧主题名 | ❌ 不更新 |
-| 登录表单样式 | PHP `$config['login_form']` | 旧表单类型 | ❌ 不更新 |
-| reCAPTCHA | PHP `$config['gcaptcha_site_key']` | 旧 key | ❌ 不更新 |
-| Logo 图片 | PHP `$config['company_logo']` | 旧 logo | ❌ 不更新 |
+这些是首次 GET 渲染时由 PHP 写入 HTML 的值，AJAX 成功后不会变：
 
-**实际影响评估**：
+| DOM 元素 | 来源 | 全新安装时的初始值 | AJAX 后 | 影响评估 |
+|----------|------|--------------------|---------|----------|
+| `<html lang>` | [current_language_code()](file:///d:/fz/0601-1/solo-dogfeeding/code/20-opensourcepos/app/Views/login.php#L19) | `en`（默认值） | ❌ 不变 | ⚠️ 无影响：登录页无多语言内容 |
+| `<title>` | [$config['company']](file:///d:/fz/0601-1/solo-dogfeeding/code/20-opensourcepos/app/Views/login.php#L24) | `Home`（默认值） | ❌ 不变 | ⚠️ 无影响：标题不影响功能 |
+| 主题 CSS | [$config['theme']](file:///d:/fz/0601-1/solo-dogfeeding/code/20-opensourcepos/app/Views/login.php#L29-L35) | `flatly`（默认值） | ❌ 不变 | ⚠️ 无影响：默认主题就是新安装主题 |
+| 登录表单样式 | [$config['login_form']](file:///d:/fz/0601-1/solo-dogfeeding/code/20-opensourcepos/app/Views/login.php#L99) | `floating_labels`（默认） | ❌ 不变 | ⚠️ 无影响：默认值与新安装一致 |
+| reCAPTCHA | [$config['gcaptcha_site_key']](file:///d:/fz/0601-1/solo-dogfeeding/code/20-opensourcepos/app/Views/login.php#L131) | 空字符串（默认） | ❌ 不变 | ✅ 无影响：新安装不启用 reCAPTCHA |
+| Logo | [$config['company_logo']](file:///d:/fz/0601-1/solo-dogfeeding/code/20-opensourcepos/app/Views/login.php#L44) | 空（默认）→ 显示 SVG | ❌ 不变 | ⚠️ 无影响：默认就是 SVG logo |
 
-对于全新安装场景（`is_new_install = true`）：
-- 初始页面没有旧的 `$config` 值（数据库为空，`getDefaultSettings()` 仅提供 4 个字段）
-- 迁移后 `initial_schema.sql` 插入了完整配置
-- 但页面上用的是旧实例渲染的 HTML，新配置**不会自动反映**
-- 不过由于是全新安装，旧值和新值差异不大（公司名 "Home"、默认主题 "flatly" 等）
+**关键纠正**：说"页面停留在旧 DOM"容易误导。对于全新安装场景，首次渲染时数据库还是空的，
+PHP 使用的是 `getDefaultSettings()` 返回的 4 个默认值（`language=english`, `language_code=en`,
+`company=Home`, `barcode_type=Code39`）。迁移后数据库写入的配置值与默认值大部分一致
+（公司名仍是 Home，主题仍是 flatly），**不存在"旧值"与"新值"冲突的问题**。
 
-对于升级场景（`is_latest = false`）：
-- 前端逻辑：`!APP_STATE.isNewInstall` → `showLoginForm()` 直接显示登录表单
-- 登录表单的 POST 走路径 A → `redirect()->to('login')` → 新请求加载最新配置
-- ✅ 升级场景不受 AJAX 同页问题影响
+#### 第二层：JS 动态管理的 DOM 元素（已正确更新）
 
-### 8.3 下个请求生效：AJAX 迁移后用户提交登录表单
+| DOM 元素 | 更新方式 | 值来源 |
+|----------|----------|--------|
+| 标题 `<h3>` | `$heading.text(APP_STATE.i18n.welcome)` | JS 内置翻译字符串，不依赖服务端配置 |
+| 按钮文字 | `$submitButton.text(APP_STATE.i18n.go)` | JS 内置翻译字符串 |
+| 成功提示 | `$success.removeClass('d-none')` | PHP 硬编码在 HTML 中，翻译字符串 |
 
-AJAX 成功后，页面上的登录表单变为可见。用户输入用户名密码后提交：
+**这些元素完全由 JS 客户端状态驱动，与服务端配置无关，不涉及旧值问题。**
+
+### 8.5 登录提交后的配置生效时机
+
+AJAX 成功后用户输入密码点击 "Go"：
 
 ```
-POST /login
-  ├─ APP_STATE.isNewInstall = false（已被 JS 修改）
-  ├─ 但 e.preventDefault() 条件不满足 → 正常提交表单
-  └─ 服务端 Login::index() 处理：
-      ├─ is_latest() = true → 不再执行迁移
-      ├─ 验证用户名密码
-      └─ 成功 → redirect()->to('home')
+点击 "Go" → 表单提交
+  ├─ APP_STATE.isNewInstall = false（已被 AJAX 成功回调修改）
+  ├─ if (APP_STATE.isNewInstall) 不成立 → 不拦截
+  └─ 表单正常 POST /login
 ```
 
-**关键**：表单正常 POST 提交后，服务端**重新**执行 `Login::index()`：
-1. `new MY_Migration()` → `is_latest() = true`
-2. `config(OSPOS::class)->settings` → **新请求实例化新 OSPOS 对象**
-3. 新 OSPOS 构造函数调用 `set_settings()`
-4. 此时检查缓存（可能已被迁移中的 `Appconfig::save()` 刷新）
+**服务端 `Login::index()` 处理此 POST 请求的精确路径**：
 
-**但存在窗口期**：如果所有迁移都是 SQL 直接插入（不走 `Appconfig::save()`），缓存可能在 5 分钟内未更新。
+[Login::index()](file:///d:/fz/0601-1/solo-dogfeeding/code/20-opensourcepos/app/Controllers/Login.php#L23-L75)
 
-### 8.4 失败后批次回滚重算边界
+```php
+// 步骤 1：创建迁移实例
+$migration = new MY_Migration(config('Migrations'));
+$config = config(OSPOS::class)->settings;  // ← 此时加载配置
 
-#### 8.4.1 AJAX 失败的前端处理
+// 步骤 2：检查方法
+if ($this->request->getMethod() !== 'POST') {
+    return view('login', $data);  // GET → 不走这里
+}
+
+// 步骤 3：检查是否需要迁移
+if (!$data['is_latest'] || $data['is_new_install']) {
+    // is_latest = true, is_new_install = false → 不走这里
+}
+
+// 步骤 4：验证登录
+$rules = ['username' => 'required|login_check[data]'];
+if (!$this->validate($rules, $messages)) {
+    return view('login', $data);  // 验证失败 → 重新渲染页面
+}
+
+// 步骤 5：登录成功
+return redirect()->to('home');
+```
+
+**配置在这个 POST 请求中的加载链**：
+
+```
+POST /login 请求开始
+  ├─ CI4 框架启动
+  ├─ 控制器实例化 → post_controller_constructor 事件
+  │   └─ Load_config::load_config()
+  │       ├─ new MY_Migration() → is_latest() = true → 不销毁 session ✅
+  │       ├─ config(OSPOS::class)->settings  ← 此时 OSPOS 已实例化
+  │       │   └─ set_settings()
+  │       │       ├─ 读缓存：cache->get('settings')
+  │       │       │   ├─ 缓存命中（未过期）→ 使用缓存值
+  │       │       │   └─ 缓存未命中 → 查数据库 → 写缓存
+  │       │       └─ 设置语言、时区
+  │       └─ 使用配置值设置运行时环境
+  │
+  ├─ Login::index() 执行
+  │   ├─ config(OSPOS::class)->settings  ← 同一单例
+  │   ├─ is_latest() = true → 不执行迁移
+  │   └─ 验证登录
+  │
+  └─ 登录成功 → redirect()->to('home')
+      └─ GET /home → 新请求 → 新 OSPOS 实例 → 重新加载配置
+```
+
+**缓存状态的关键时间窗口**：
+
+| 迁移中的操作 | 缓存效果 | 后续请求读到的配置 |
+|-------------|----------|-------------------|
+| `$this->db->table('app_config')->ignore(true)->insertBatch(...)` | 缓存**未刷新** | ⚠️ 缓存若未过期则读到旧值 |
+| `$this->db->query("INSERT IGNORE INTO app_config ...")` via SQL 文件 | 缓存**未刷新** | ⚠️ 同上 |
+| `$appconfig->save(['key' => 'value'])` | 缓存**已刷新**（`update_settings()`） | ✅ 读到最新值 |
+| `executeScriptWithTransaction($sql_file)` | 缓存**未刷新** | ⚠️ 同上 |
+
+**但实际影响有限**：
+
+1. **全新安装场景**：首次 GET 时缓存中存的是 `getDefaultSettings()` 的 4 个默认值
+   或空配置。迁移执行后 `initial_schema.sql` 写入大量配置到数据库，
+   但缓存**不会自动清除**。不过——
+   
+2. **缓存中存的是什么**：首次 GET 时 `app_config` 表不存在（全新安装），
+   所以 `set_settings()` 走了 `$this->settings = $this->getDefaultSettings()` 分支，
+   **但没有调用 `cache->save()`**——看代码：
+
+   [OSPOS::set_settings()](file:///d:/fz/0601-1/solo-dogfeeding/code/20-opensourcepos/app/Config/OSPOS.php#L40-L46)
+   ```php
+   if (!$db->tableExists('app_config')) {
+       $this->settings = $this->getDefaultSettings();
+       return;  // ← 直接返回，没有写缓存！
+   }
+   ```
+
+3. **因此缓存中没有旧配置条目**：全新安装时缓存从未写入 `settings` 键。
+   迁移后的 POST 请求中 `cache->get('settings')` 返回 false → 走数据库读取 → ✅ 最新配置
+
+4. **升级场景不经过 AJAX 路径**：已确认升级走路径 A（POST /login + redirect），
+   新 GET 请求中 OSPOS 重新实例化。缓存可能还是旧的，但——
+   如果迁移中有任何 `Appconfig::save()` 调用，缓存已被清除。
+
+**精确结论**：
+
+| 场景 | 缓存状态 | 配置是否最新 |
+|------|----------|-------------|
+| 全新安装 AJAX 成功 → POST 登录 | 缓存无 `settings` 键（从未写入） | ✅ 最新（从数据库读） |
+| 升级路径 A + 迁移中有 `save()` | 缓存已被 `save()` 清除 | ✅ 最新（从数据库读） |
+| 升级路径 A + 迁移全是 SQL 插入 | 缓存仍是旧值（5分钟内） | ⚠️ 可能是旧值 |
+| 升级路径 A + 缓存已过期（>5分钟） | 缓存过期自动重新读 | ✅ 最新（从数据库读） |
+
+### 8.6 失败后批次回滚重算
+
+#### 8.6.1 AJAX 失败的前端处理
 
 [login.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-opensourcepos/app/Views/login.php#L232-L241)
 
@@ -1031,288 +1160,305 @@ function showMigrationError(message) {
     $progress.addClass('d-none');
     $success.addClass('d-none');
     $loginFields.addClass('d-none');
-    $errorMessage.text(message);        // 显示错误信息
-    $error.removeClass('d-none');        // 显示错误框
+    $errorMessage.text(message);
+    $error.removeClass('d-none');
     $warning.addClass('d-none');
     $submitButton.text(APP_STATE.i18n.migrate);  // 按钮恢复为 "迁移"
     $submitButton.prop('disabled', false);        // 重新可点击
 }
 ```
 
-**用户再次点击迁移按钮时的代码路径**：
+**关键**：失败时 `APP_STATE.isNewInstall` 仍为 `true`（成功回调中才改为 `false`）。
+用户再次点击按钮 → `if (APP_STATE.isNewInstall)` 仍成立 → 再次 AJAX POST `/migrate`。
+
+#### 8.6.2 服务端重试：`latest()` 重算批次
+
+第二次调用 `Login::migrate()` → `latest()`，CI4 的 `latest()` 重新执行完整的
+"扫描 → 对比历史 → 执行缺失" 流程：
 
 ```
-第二次点击提交按钮
-  ├─ APP_STATE.isNewInstall 仍为 true（首次失败时未改为 false）
-  ├─ e.preventDefault() 生效 → 阻止表单提交
-  ├─ showMigrationProgress() → 显示进度条
-  └─ $.ajax POST /migrate → 服务端再次执行
+latest() 重算过程：
+  ├─ ensureTable() → migrations 表已存在，跳过
+  ├─ findMigrations() → 扫描所有迁移文件，按版本升序排列
+  ├─ getHistory($group) → 查询 migrations 表中已执行记录
+  ├─ 过滤：移除历史中已有的迁移 → 得到待执行列表
+  ├─ getLastBatch() + 1 → 新批次号
+  └─ foreach 待执行 → 逐个 migrate('up') → addHistory()
 ```
 
-#### 8.4.2 服务端 `Login::migrate()` 的重试逻辑
+**重算的精确逻辑**取决于首次失败时 migrations 表的状态：
+
+#### 场景 1：`regress(-1)` 正常回滚后重算
+
+```
+首次 latest() 执行：
+  ├─ 迁移 A: up() 成功 → addHistory(batch=2) ✓
+  ├─ 迁移 B: up() 成功 → addHistory(batch=2) ✓
+  └─ 迁移 C: up() 抛异常 ✗
+      ├─ regress(-1) 自动触发
+      ├─ B.down() → removeHistory(B) → 删除 batch=2 中 B 的记录
+      ├─ A.down() → removeHistory(A) → 删除 batch=2 中 A 的记录
+      └─ 抛出 RuntimeException → 被 catch 捕获
+
+migrations 表状态：batch=2 的记录全部被清除
+```
+
+**第二次 `latest()` 重算**：
+- `getHistory()` 不含 A、B → A、B 都在待执行列表中
+- `getLastBatch()` = 1（假设之前完成到 batch=1）→ 新 batch=2
+- A、B、C 全部重新执行，A、B 依赖幂等性
+- ✅ 最终一致
+
+#### 场景 2：PHP 致命错误（`regress` 未执行）
+
+```
+首次 latest() 执行：
+  ├─ 迁移 A: up() 成功 → addHistory(batch=2) ✓
+  └─ 迁移 B: up() 中 PHP Fatal Error
+      ├─ B 的数据可能已部分写入数据库
+      ├─ addHistory(B) 未执行
+      └─ regress(-1) 未执行 → 进程崩溃
+
+migrations 表状态：只有 A 的记录（batch=2）
+```
+
+**第二次 `latest()` 重算**：
+- `getHistory()` 返回 A（batch=2）→ A 被过滤掉
+- B 不在历史中 → B 在待执行列表中
+- `getLastBatch()` = 2 → 新 batch=3
+- 只重新执行 B（⚠️ 依赖 B 的幂等性）
+- A 留在 batch=2，B、C 记录在 batch=3
+
+#### 场景 3：`addHistory()` 成功后、下一个迁移之前中断
+
+```
+首次 latest() 执行：
+  ├─ 迁移 A: up() 成功 → addHistory(batch=2) ✓
+  ├─ 迁移 B: up() 成功 → addHistory(batch=2) ✓
+  └─ （服务器重启 / 网络断开，在执行 C 之前）
+
+migrations 表状态：A、B 都在 batch=2
+```
+
+**第二次 `latest()` 重算**：
+- `getHistory()` 返回 A、B → 都被过滤掉
+- 只执行 C 和后续迁移
+- ✅ 最理想情况，无重复执行
+
+#### 8.6.3 `execute_script()` 的静默失败：一个特殊边界
+
+[execute_script()](file:///d:/fz/0601-1/solo-dogfeeding/code/20-opensourcepos/app/Helpers/migration_helper.php#L10-L42)
 
 ```php
-public function migrate(): ResponseInterface
+function execute_script(string $path): bool
 {
-    try {
-        $migration = new MY_Migration(config('Migrations'));
-        $migration->migrate_to_ci4();   // CI4 转换已完则跳过
-        set_time_limit(3600);
-        $migration->setNamespace('App')->latest();  // 核心重试入口
-        return $this->response->setJSON(['success' => true, ...]);
-    } catch (\Exception $e) {
-        return $this->response->setJSON(['success' => false, ...])->setStatusCode(500);
+    $success = true;
+    foreach ($sqls as $statement) {
+        $hadError = !$db->simpleQuery($statement);
+        if ($hadError) {
+            $success = false;        // 记录失败
+            // 但不抛异常，继续执行后续 SQL
+        }
     }
+    return $success;
 }
 ```
 
-**`latest()` 重算批次的过程**：
-
-```
-第二次调用 latest()
-  ├─ ensureTable() → migrations 表已存在，跳过
-  ├─ findMigrations() → 扫描所有迁移文件
-  ├─ getHistory() → 查询 migrations 表
-  │   ├─ 场景 1：首次 latest() 失败后 regress(-1) 已回滚整批
-  │   │   └─ migrations 表中无当前批次记录 → 所有失败的迁移重新执行
-  │   ├─ 场景 2：首次 latest() 中 PHP 致命错误，regress 未执行
-  │   │   └─ migrations 表中有部分已成功迁移的记录 → 只执行剩余部分
-  │   └─ 场景 3：首次 latest() 在 addHistory() 前中断
-  │       └─ 数据已写但无历史 → 重新执行该迁移（依赖幂等性）
-  ├─ getLastBatch() + 1 → 新批次号
-  └─ foreach 待执行迁移 → 逐个执行
+**问题**：`execute_script()` 返回 `false`，但迁移类的 `up()` 方法**不检查返回值**：
+```php
+public function up(): void
+{
+    helper('migration');
+    execute_script($sql_file);  // 返回值被忽略
+}
 ```
 
-#### 8.4.3 三种失败场景的回滚重算边界
+**后果**：`up()` 正常返回（void），CI4 认为迁移成功，调用 `addHistory()` 写入历史。
+部分 SQL 失败但迁移被标记为成功。这是 `execute_script()` 的设计选择——容错继续执行，
+避免 DDL 语句的事务问题。这意味着 `regress(-1)` **不会触发**，因为 CI4 不知道失败了。
 
-**场景 1：CI4 `regress(-1)` 正常执行**
+**对比**：[executeScriptWithTransaction()](file:///d:/fz/0601-1/solo-dogfeeding/code/20-opensourcepos/app/Helpers/migration_helper.php#L49-L88) 会在 SQL 失败时 `transRollback()` 回滚 DML 操作，
+但返回值同样未被 `up()` 检查。不过事务回滚保证了数据库一致性。
 
-CI4 `MigrationRunner::latest()` 内部失败时自动调用 `regress(-1)`：
-```
-latest() 执行中
-  ├─ 迁移 A: up() 成功 → addHistory(batch=2) ✓
-  ├─ 迁移 B: up() 成功 → addHistory(batch=2) ✓
-  └─ 迁移 C: up() 失败 ✗
-      ├─ regress(-1) 自动触发
-      ├─ 查询 batch=2 的记录 → 找到 A、B
-      ├─ B.down() → removeHistory(B)
-      ├─ A.down() → removeHistory(A)
-      └─ 抛出 RuntimeException → catch 捕获 → 返回 JSON {success: false}
-```
+#### 8.6.4 `down()` 回滚边界对重跑的影响
 
-**第二次 `latest()` 重算**：
-- `getHistory()` 不含 A、B、C → 三个都重新执行
-- `getLastBatch()` 返回 1（假设之前完成到 batch=1） → 新 batch=2
-- ✅ 依赖 A、B 的幂等性
+| `down()` 类型 | 回滚行为 | 重跑结果 | 示例 |
+|--------------|----------|---------|------|
+| **空实现** | 配置保留，历史删除 | `INSERT IGNORE` 跳过 → ✅ | [20250716170000](file:///d:/fz/0601-1/solo-dogfeeding/code/20-opensourcepos/app/Database/Migrations/20250716170000_MissingConfigKeys.php#L21-L24) |
+| **不删除配置** | 配置保留，历史删除 | `INSERT IGNORE` 跳过 → ✅ | [20230412000000](file:///d:/fz/0601-1/solo-dogfeeding/code/20-opensourcepos/app/Database/Migrations/20230412000000_add_missing_config.php#L32-L35) |
+| **删除配置** | 配置删除，历史删除 | 重新插入 → ✅ | [20200508000000](file:///d:/fz/0601-1/solo-dogfeeding/code/20-opensourcepos/app/Database/Migrations/20200508000000_image_upload_defaults.php#L29-L34) |
+| **通过 save() 更新** | save() 刷新缓存，值回退 | 重新 save() → ✅ | [20240319000000](file:///d:/fz/0601-1/solo-dogfeeding/code/20-opensourcepos/app/Database/Migrations/20240319000000_Migration_Convert_Barcode_Types.php#L53-L75) |
+| **DDL 变更** | DDL 无法回滚 | 存在性检查跳过 → ✅ | 各版本 DDL 迁移 |
+| **不可逆** | down() 为空 | 幂等 up() → ✅ | [20250521000000](file:///d:/fz/0601-1/solo-dogfeeding/code/20-opensourcepos/app/Database/Migrations/20250521000000_FixImageFilenameSpaces.php#L60-L64) |
 
-**场景 2：PHP 致命错误（`regress` 未执行）**
+**结论**：无论 `down()` 实现如何，重跑都能成功——这是 OSPOS 迁移幂等性设计的核心保障。
 
-```
-latest() 执行中
-  ├─ 迁移 A: up() 成功 → addHistory(batch=2) ✓
-  ├─ 迁移 B: up() 中 PHP Fatal Error → 进程崩溃
-  │   ├─ B 的数据可能已部分写入数据库
-  │   ├─ addHistory(B) 未执行
-  │   └─ regress(-1) 未执行
-  └─ PHP 进程终止，AJAX 超时或返回 500
-```
-
-**第二次 `latest()` 重算**：
-- `getHistory()` 返回 A（batch=2）→ A 被跳过
-- B 不在历史中 → B 重新执行
-- ⚠️ B 的部分数据可能已在数据库中 → 依赖 B 的幂等性
-- `getLastBatch()` 返回 2 → 新 batch=3
-- A 留在 batch=2，B、C 等记录在 batch=3
-
-**场景 3：`execute_script()` SQL 执行失败（非事务场景）**
-
-```
-迁移 B 的 up():
-  helper('migration');
-  execute_script($sql_file);
-
-execute_script() 内部：
-  foreach ($sqls as $statement) {
-      $hadError = !$db->simpleQuery($statement);
-      // SQL1 成功 → 数据已提交
-      // SQL2 失败 → $hadError = true，但继续执行
-      // SQL3 成功 → 数据已提交
-  }
-  return $success;  // 返回 false
-```
-
-**关键**：`execute_script()` 不抛异常，返回 `bool`。但 `Migration::up()` 没有
-检查返回值，所以 `latest()` 认为迁移成功，继续 `addHistory()`。
-
-**后果**：迁移被标记为成功，但部分 SQL 失败了。这是 `execute_script()` 的
-设计选择——容错继续执行，避免 DDL 语句的事务问题。
-
-**对比**：`executeScriptWithTransaction()` 在 SQL 失败时返回 false，但同样
-在 `up()` 中返回值未被检查。不过 `transRollback()` 会回滚事务内的 DML 操作。
-
-#### 8.4.4 `down()` 回滚边界对重跑的影响
-
-**典型配置迁移的 `down()` 分类**：
-
-| 分类 | 行为 | 回滚后重跑的结果 | 示例 |
-|------|------|-----------------|------|
-| **空实现** | 配置保留，历史删除 | `INSERT IGNORE` 跳过 → 成功 | [20250716170000](file:///d:/fz/0601-1/solo-dogfeeding/code/20-opensourcepos/app/Database/Migrations/20250716170000_MissingConfigKeys.php#L21-L24) |
-| **不删除配置** | 配置保留，历史删除 | `INSERT IGNORE` 跳过 → 成功 | [20230412000000](file:///d:/fz/0601-1/solo-dogfeeding/code/20-opensourcepos/app/Database/Migrations/20230412000000_add_missing_config.php#L32-L35) |
-| **删除配置** | 配置删除，历史删除 | 重新插入 → 成功 | [20200508000000](file:///d:/fz/0601-1/solo-dogfeeding/code/20-opensourcepos/app/Database/Migrations/20200508000000_image_upload_defaults.php#L29-L34) |
-| **通过 save() 更新** | save() 触发缓存刷新，值可能回退 | 重新 save() → 成功 | [20240319000000](file:///d:/fz/0601-1/solo-dogfeeding/code/20-opensourcepos/app/Database/Migrations/20240319000000_Migration_Convert_Barcode_Types.php#L53-L75) |
-| **DDL 变更** | DDL 无法回滚 | 依赖存在性检查 → 成功 | 各版本 DDL 迁移 |
-| **不可逆** | down() 为空 | 重新执行幂等 up() → 成功 | [20250521000000](file:///d:/fz/0601-1/solo-dogfeeding/code/20-opensourcepos/app/Database/Migrations/20250521000000_FixImageFilenameSpaces.php#L60-L64) |
-
-**结论**：无论 `down()` 实现如何，重跑都能成功——这是 OSPOS 迁移设计中最核心的保障。
-
-### 8.5 完整的 AJAX 迁移请求生命周期
-
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│ 首次 GET /login                                                      │
-│                                                                      │
-│  Login::index()                                                      │
-│    ├─ config(OSPOS::class)->settings  ← 旧配置，加载到 $data['config']│
-│    ├─ is_latest() = false                                            │
-│    ├─ is_new_install = true                                          │
-│    └─ return view('login', $data)  ← PHP 渲染 HTML，配置值固化到 DOM  │
-│                                                                      │
-│  post_controller_constructor → Load_config::load_config()            │
-│    ├─ is_latest() = false → session->destroy()                       │
-│    └─ 旧配置设置语言/时区                                             │
-│                                                                      │
-│  浏览器收到 HTML:                                                     │
-│    ├─ <html lang="旧语言代码">                                        │
-│    ├─ <title>旧公司名</title>                                         │
-│    ├─ 旧主题 CSS                                                      │
-│    └─ 显示"迁移"按钮（因为 is_new_install=true）                       │
-└──────────────────────────────────────────────────────────────────────┘
-         │
-         │ 用户点击"迁移"
-         ▼
-┌──────────────────────────────────────────────────────────────────────┐
-│ AJAX POST /migrate                                                   │
-│                                                                      │
-│  Login::migrate()                                                    │
-│    ├─ 新 MY_Migration 实例                                           │
-│    ├─ migrate_to_ci4()  ← 如需要                                     │
-│    ├─ latest()                                                        │
-│    │   ├─ 迁移 A: INSERT IGNORE 配置到 DB                             │
-│    │   │   └─ DB 有新值，缓存未刷新，OSPOS 内存实例仍是旧值            │
-│    │   ├─ 迁移 B: $appconfig->save()                                 │
-│    │   │   └─ 触发 update_settings() → 缓存删除+重载 → 内存有新值    │
-│    │   └─ ... 更多迁移 ...                                           │
-│    └─ return JSON {success: true}                                    │
-│                                                                      │
-│  ⚠️ 此请求的 OSPOS 单例内存中：                                       │
-│     如果有迁移走 save() → 有新配置 ✅                                  │
-│     如果全是 SQL 插入 → 仍是旧配置 ❌                                  │
-│     但这不影响，因为此请求只返回 JSON，不渲染 HTML                      │
-└──────────────────────────────────────────────────────────────────────┘
-         │
-         │ JS 收到 {success: true}
-         ▼
-┌──────────────────────────────────────────────────────────────────────┐
-│ 同页 DOM 操作（无新 HTTP 请求）                                       │
-│                                                                      │
-│  showMigrationSuccess()                                              │
-│    ├─ 隐藏进度条，显示成功提示                                        │
-│    ├─ 显示登录表单                                                   │
-│    ├─ APP_STATE.isNewInstall = false                                 │
-│    └─ 按钮文字改为 "Go"                                              │
-│                                                                      │
-│  ⚠️ 页面上仍残留的旧配置值：                                          │
-│     <html lang="旧语言"> → 不会变                                     │
-│     <title>旧公司名</title> → 不会变                                   │
-│     旧主题 CSS → 不会变                                               │
-│                                                                      │
-│  ✅ 但这些对功能无影响：                                               │
-│     - 语言不影响登录                                                  │
-│     - 公司名/主题不影响功能                                           │
-│     - 用户登录后会 redirect→home，home 页面全新渲染                    │
-└──────────────────────────────────────────────────────────────────────┘
-         │
-         │ 用户输入密码后点击 "Go"
-         ▼
-┌──────────────────────────────────────────────────────────────────────┐
-│ POST /login（正常表单提交）                                           │
-│                                                                      │
-│  Login::index()                                                      │
-│    ├─ APP_STATE.isNewInstall = false → 不走 AJAX 分支                │
-│    ├─ is_latest() = true → 不再执行迁移                               │
-│    ├─ config(OSPOS::class)->settings ← 新请求，新 OSPOS 实例         │
-│    │   ├─ 缓存被之前的 save() 刷过 → 读数据库 → 最新配置 ✅           │
-│    │   └─ 缓存未被刷过 → 读旧缓存 → 旧配置 ⚠️（5分钟内可能）         │
-│    ├─ 验证用户名密码                                                  │
-│    └─ 成功 → redirect()->to('home')                                  │
-│                                                                      │
-│  GET /home（新请求）                                                  │
-│    ├─ OSPOS 新实例 → set_settings()                                  │
-│    └─ 此时缓存大概率已过期或已刷新 → 最新配置 ✅                       │
-└──────────────────────────────────────────────────────────────────────┘
-```
-
-### 8.6 失败后重试的完整流程
-
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│ 首次 AJAX POST /migrate → 失败                                       │
-│                                                                      │
-│  Login::migrate()                                                    │
-│    ├─ latest() 执行中                                                │
-│    │   ├─ 迁移 A: up() 成功 → addHistory(batch=2) ✓                 │
-│    │   └─ 迁移 B: up() 失败 ✗                                        │
-│    │       ├─ regress(-1) 自动触发                                   │
-│    │       ├─ A.down() → removeHistory(A) → A 的历史记录删除         │
-│    │       └─ 抛出 RuntimeException                                  │
-│    └─ catch → return JSON {success: false, message: "..."} → 500    │
-│                                                                      │
-│  数据库状态：                                                         │
-│    ├─ migrations 表: batch=2 的记录已被 regress 删除                  │
-│    ├─ app_config 表: 迁移 A 插入的配置仍存在（down()为空）            │
-│    └─ 迁移 B 的变更：看 B 的 down() 是否有逻辑                       │
-└──────────────────────────────────────────────────────────────────────┘
-         │
-         │ JS 显示错误提示 + 重试按钮
-         ▼
-┌──────────────────────────────────────────────────────────────────────┐
-│ 第二次 AJAX POST /migrate → 重试                                     │
-│                                                                      │
-│  Login::migrate()                                                    │
-│    ├─ migrate_to_ci4() → 已完成，跳过                                 │
-│    ├─ latest()                                                       │
-│    │   ├─ findMigrations() → 所有迁移文件                             │
-│    │   ├─ getHistory() → 不含 A、B（已被 regress 清除）               │
-│    │   ├─ getLastBatch() → 1（batch=2 已被清空）→ 新 batch=2          │
-│    │   ├─ 迁移 A: up() 重新执行                                      │
-│    │   │   └─ INSERT IGNORE → 配置已存在，跳过 → 成功 ✅              │
-│    │   │   └─ addHistory(batch=2)                                    │
-│    │   └─ 迁移 B: up() 重新执行                                      │
-│    │       └─ 期望这次能成功（修复了问题或重试成功）                    │
-│    │       └─ addHistory(batch=2)                                    │
-│    └─ return JSON {success: true} ✅                                 │
-└──────────────────────────────────────────────────────────────────────┘
-```
-
-### 8.7 特殊边界：regress(-1) 本身失败
-
-**场景**：迁移 A `up()` 成功，但 A 的 `down()` 也失败（如 DDL 无法回滚）
+#### 8.6.5 `regress(-1)` 本身失败的边界
 
 ```
 latest() 执行中
   ├─ 迁移 A: up() 成功 → addHistory(batch=2) ✓
   └─ 迁移 B: up() 失败 ✗
       ├─ regress(-1) 触发
-      ├─ A.down() 失败 → removeHistory(A) 不执行
-      │   └─ A 的历史记录仍在 migrations 表中
+      ├─ A.down() 失败（如 DDL 无法回滚）
+      │   └─ removeHistory(A) 不执行 → A 的历史记录仍在
       └─ 抛出 RuntimeException
 ```
 
 **第二次 `latest()` 重算**：
-- `getHistory()` 返回 A（batch=2）→ A 被跳过
+- `getHistory()` 返回 A（batch=2）→ A 被过滤掉
 - 只重新执行 B
-- ⚠️ A 的回滚未完成，数据处于不一致状态
-- 但 A 的 `up()` 逻辑已经生效，后续迁移依赖 A 的变更时不会出错
+- ⚠️ A 的回滚未完成，但 A 的 `up()` 已生效
+- 后续迁移依赖 A 的变更时不会出错（A 的效果已存在）
+
+### 8.7 完整的 AJAX 迁移生命周期图（纠正版）
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│ 1. GET /login（首次访问）                                             │
+│                                                                      │
+│  Login::index()                                                      │
+│    ├─ config(OSPOS::class)->settings                                 │
+│    │   └─ app_config 表不存在 → getDefaultSettings() → 4 个默认值    │
+│    │       ⚠️ 不写缓存（因为 tableExists 检查失败后直接 return）      │
+│    ├─ is_latest() = false                                            │
+│    ├─ is_new_install = true（migrations 表为空）                      │
+│    └─ return view('login', $data)                                    │
+│                                                                      │
+│  post_controller_constructor → Load_config::load_config()            │
+│    ├─ is_latest() = false → session->destroy()                       │
+│    └─ 用默认配置设置语言/时区                                         │
+│                                                                      │
+│  浏览器收到 HTML：                                                    │
+│    ├─ <html lang="en">（默认值）                                      │
+│    ├─ <title>Home | OSPOS | Login</title>（默认值）                   │
+│    ├─ flatly 主题 CSS（默认值）                                       │
+│    ├─ 登录表单初始隐藏（is_new_install=true → d-none）                │
+│    └─ 按钮显示"迁移"                                                  │
+└──────────────────────────────────────────────────────────────────────┘
+         │
+         │ 用户点击"迁移"
+         ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ 2. AJAX POST /migrate                                                │
+│                                                                      │
+│  Login::migrate()                                                    │
+│    ├─ new MY_Migration()                                             │
+│    ├─ migrate_to_ci4() → 全新安装无需转换                             │
+│    ├─ latest() 执行所有迁移                                          │
+│    │   ├─ initial_schema.sql → 建表 + 插入 ~80 条初始配置            │
+│    │   ├─ ... 各版本迁移 ...                                         │
+│    │   └─ 最后一个迁移完成 → addHistory()                             │
+│    └─ return JSON {success: true}                                    │
+│                                                                      │
+│  ⚠️ 此请求的 OSPOS 实例：                                            │
+│     - 构造时 app_config 不存在 → getDefaultSettings()                │
+│     - 迁移执行后 app_config 已有数据，但 OSPOS 实例不刷新             │
+│     - 无影响：此请求只返回 JSON，不渲染 HTML                          │
+└──────────────────────────────────────────────────────────────────────┘
+         │
+         │ JS 收到 {success: true}
+         ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ 3. 同页 DOM 操作（无新 HTTP 请求）                                    │
+│                                                                      │
+│  showMigrationSuccess()                                              │
+│    ├─ 隐藏进度条、警告、错误                                         │
+│    ├─ 显示"迁移完成"提示                                             │
+│    ├─ 标题改为 "Welcome to OSPOS"（JS 翻译字符串，非服务端配置）       │
+│    ├─ 显示登录表单                                                   │
+│    ├─ APP_STATE.isNewInstall = false                                 │
+│    └─ 按钮文字改为 "Go"                                              │
+│                                                                      │
+│  ⚠️ HTML 中 PHP 硬编码的配置值未更新，但：                            │
+│     - 全新安装时这些值就是默认值（en/Home/flatly/floating_labels）    │
+│     - 迁移后数据库中的配置与默认值一致（initial_schema 使用相同默认值）│
+│     - 所以"旧值"= "新值"，不存在不一致                                │
+│                                                                      │
+│  ✅ 此页面完全可以正常使用：                                          │
+│     - 登录表单功能正确                                                │
+│     - 无 reCAPTCHA（默认不启用）                                      │
+│     - 主题是正确的 flatly                                             │
+└──────────────────────────────────────────────────────────────────────┘
+         │
+         │ 用户输入密码后点击 "Go"
+         ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ 4. POST /login（正常表单提交）                                        │
+│                                                                      │
+│  Login::index()                                                      │
+│    ├─ APP_STATE.isNewInstall = false → JS 不拦截 → 正常提交          │
+│    ├─ is_latest() = true → 不执行迁移                                │
+│    ├─ config(OSPOS::class)->settings ← 新 OSPOS 实例                 │
+│    │   └─ set_settings()                                             │
+│    │       ├─ cache->get('settings') → false（从未写入缓存）         │
+│    │       ├─ app_config 表已存在 → 查询数据库                       │
+│    │       ├─ 读取所有配置 → $this->settings                         │
+│    │       └─ cache->save('settings', ...) → 写入缓存               │
+│    ├─ 验证用户名密码                                                  │
+│    └─ 成功 → redirect()->to('home')                                  │
+│                                                                      │
+│  ✅ 配置完全是最新的：缓存从未写入过旧值 → 必定从数据库读取            │
+└──────────────────────────────────────────────────────────────────────┘
+         │
+         │ 302 重定向
+         ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ 5. GET /home                                                         │
+│                                                                      │
+│  Home 控制器 → 新 OSPOS 实例                                         │
+│    ├─ cache->get('settings') → 命中（步骤 4 已写入）                 │
+│    └─ 使用完整配置渲染页面 ✅                                         │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+### 8.8 失败后重试的完整流程
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│ AJAX POST /migrate → 失败                                            │
+│                                                                      │
+│  Login::migrate()                                                    │
+│    ├─ latest() 执行中                                                │
+│    │   ├─ 迁移 A: up() 成功 → addHistory(batch=2) ✓                 │
+│    │   └─ 迁移 B: up() 抛异常 ✗                                      │
+│    │       ├─ regress(-1) 自动触发                                   │
+│    │       ├─ A.down() → removeHistory(A) → A 的历史记录删除         │
+│    │       └─ 抛出 RuntimeException                                  │
+│    └─ catch → return JSON {success: false, message: "..."} → 500    │
+│                                                                      │
+│  数据库状态：                                                         │
+│    ├─ migrations 表: batch=2 记录被 regress 清除                     │
+│    ├─ app_config 表: A 插入的配置可能仍在（down() 为空时）            │
+│    └─ 缓存：从未写入（全新安装场景）                                  │
+│                                                                      │
+│  前端状态：                                                           │
+│    ├─ APP_STATE.isNewInstall = true（未被修改）                       │
+│    └─ showMigrationError() → 显示错误 + "迁移"按钮可再次点击         │
+└──────────────────────────────────────────────────────────────────────┘
+         │
+         │ 用户再次点击 "迁移"
+         ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ 第二次 AJAX POST /migrate → 重试                                     │
+│                                                                      │
+│  Login::migrate()                                                    │
+│    ├─ new MY_Migration()                                             │
+│    ├─ migrate_to_ci4() → 已完成，跳过                                │
+│    ├─ latest()                                                       │
+│    │   ├─ findMigrations() → 所有迁移文件                             │
+│    │   ├─ getHistory() → 不含 A、B（已被 regress 清除）              │
+│    │   ├─ getLastBatch() = 1 → 新 batch=2                            │
+│    │   ├─ 迁移 A: up() 重新执行                                      │
+│    │   │   └─ INSERT IGNORE → 配置已存在，跳过 → 成功 ✅             │
+│    │   │   └─ addHistory(batch=2)                                    │
+│    │   ├─ 迁移 B: up() 重新执行                                      │
+│    │   │   └─ （期望这次成功）                                        │
+│    │   │   └─ addHistory(batch=2)                                    │
+│    │   └─ ... 后续迁移 ...                                           │
+│    └─ return JSON {success: true} ✅                                 │
+└──────────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
@@ -1439,7 +1585,7 @@ T3: 前端检测成功，刷新页面
             └─ 使用当前配置（可能是旧缓存）设置语言/时区
 ```
 
-### 9.2 确保配置立即生效的方法
+### 10.2 确保配置立即生效的方法
 
 1. **迁移中使用 `Appconfig::save()`** 而非直接 SQL：
    ```php
@@ -1511,3 +1657,14 @@ T3: 前端检测成功，刷新页面
 - 删除配置示例：[20200508000000_image_upload_defaults.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-opensourcepos/app/Database/Migrations/20200508000000_image_upload_defaults.php#L29-L34)
 - 不可逆示例：[20250521000000_FixImageFilenameSpaces.php](file:///d:/fz/0601-1/solo-dogfeeding/code/20-opensourcepos/app/Database/Migrations/20250521000000_FixImageFilenameSpaces.php#L60-L64)
 - CI4 转换：[MY_Migration::migrate_table()](file:///d:/fz/0601-1/solo-dogfeeding/code/20-opensourcepos/app/Libraries/MY_Migration.php#L84-L110)
+
+### AJAX 迁移前端代码路径
+- JS 状态管理：[login.php APP_STATE](file:///d:/fz/0601-1/solo-dogfeeding/code/20-opensourcepos/app/Views/login.php#L170-L189)
+- 表单提交拦截：[login.php $form.on('submit')](file:///d:/fz/0601-1/solo-dogfeeding/code/20-opensourcepos/app/Views/login.php#L257-L288)
+- 成功处理：[login.php showMigrationSuccess()](file:///d:/fz/0601-1/solo-dogfeeding/code/20-opensourcepos/app/Views/login.php#L221-L230)
+- 失败处理：[login.php showMigrationError()](file:///d:/fz/0601-1/solo-dogfeeding/code/20-opensourcepos/app/Views/login.php#L232-L241)
+- 登录表单显示：[login.php showLoginForm()](file:///d:/fz/0601-1/solo-dogfeeding/code/20-opensourcepos/app/Views/login.php#L243-L251)
+- 路径 A 入口：[Login::index() POST 分支](file:///d:/fz/0601-1/solo-dogfeeding/code/20-opensourcepos/app/Controllers/Login.php#L48-L57)
+- 路径 B 入口：[Login::migrate()](file:///d:/fz/0601-1/solo-dogfeeding/code/20-opensourcepos/app/Controllers/Login.php#L77-L99)
+- SQL 非事务执行：[execute_script()](file:///d:/fz/0601-1/solo-dogfeeding/code/20-opensourcepos/app/Helpers/migration_helper.php#L10-L42)
+- SQL 事务执行：[executeScriptWithTransaction()](file:///d:/fz/0601-1/solo-dogfeeding/code/20-opensourcepos/app/Helpers/migration_helper.php#L49-L88)
