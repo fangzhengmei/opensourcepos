@@ -428,11 +428,109 @@ $this->mailchimp_lib->addOrUpdateMember(
 - `$this->_list_id`：从配置 `mailchimp_list_id` 解密获取（[Customers.php L36-L39](file:///d:/fz/0601-1/solo-dogfeeding/code/18-opensourcepos/app/Controllers/Customers.php#L36-L39)）
 - API Key：从配置 `mailchimp_api_key` 解密获取（[Mailchimp_lib.php L45-L52](file:///d:/fz/0601-1/solo-dogfeeding/code/18-opensourcepos/app/Libraries/Mailchimp_lib.php#L45-L52)）
 
-### 9.4 失败静默
+### 9.4 列表 ID 为空时的请求流程
+
+**⚠️ 容易疏漏：双重静默失败路径**
+
+当 `mailchimp_list_id` 配置为空时，同步过程涉及三层失败路径，每层都可能静默跳过：
+
+```
+控制器构造函数 → $this->_list_id = ''（[Customers.php L38-L39](file:///d:/fz/0601-1/solo-dogfeeding/code/18-opensourcepos/app/Controllers/Customers.php#L38-L39)）
+    ↓
+addOrUpdateMember('', $email, ...)  // 传入空 list_id
+    ↓
+call("/lists//members/{md5}", 'PUT', $args)  // URL 变成 /lists//members/xxx
+    ↓
+_request() → curl_exec → Mailchimp API 返回 404/400 → json_decode 返回 false
+    ↓
+call() 返回 false
+    ↓
+控制器忽略返回值 → 完全静默
+```
+
+**更隐蔽的情况：API Key 为空但 List ID 存在**
+
+```
+MailchimpConnector 构造函数 → $this->_api_key = ''（[Mailchimp_lib.php L45-L53](file:///d:/fz/0601-1/solo-dogfeeding/code/18-opensourcepos/app/Libraries/Mailchimp_lib.php#L45-L53)）
+    ↓
+call() 方法检查 if (!empty($this->_api_key)) → 不通过
+    ↓
+直接 return false（[Mailchimp_lib.php L77](file:///d:/fz/0601-1/solo-dogfeeding/code/18-opensourcepos/app/Libraries/Mailchimp_lib.php#L77)）
+    ↓
+连 HTTP 请求都不会发出，更早地静默失败
+```
+
+**三层失败静默点汇总：**
+
+| 失败层级 | 检查位置 | 触发条件 | 是否发请求 | 可观测性 |
+|---------|---------|---------|-----------|---------|
+| 第1层：API Key 为空 | [Mailchimp_lib.php L73](file:///d:/fz/0601-1/solo-dogfeeding/code/18-opensourcepos/app/Libraries/Mailchimp_lib.php#L73) | `mailchimp_api_key` 配置为空 | ❌ 不发 | 完全不可见 |
+| 第2层：List ID 为空 | 无检查，直接拼接 URL | `mailchimp_list_id` 配置为空 | ✅ 发送到无效路径 | 需抓包才能发现 |
+| 第3层：API 返回错误 | [Mailchimp_lib.php L124](file:///d:/fz/0601-1/solo-dogfeeding/code/18-opensourcepos/app/Libraries/Mailchimp_lib.php#L124) | status/参数等不合法 | ✅ 正常发送 | 返回 false，无日志 |
+
+> **注意：** 第2层（List ID 为空）时，虽然会发送 HTTP 请求，但 URL 是 `/lists//members/...`，Mailchimp API 可能返回 404 或 400，最终都被静默转为 `false`，调用方无从得知具体原因。
+
+### 9.5 CSV 导入与手动表单的参数差异
+
+#### 9.5.1 订阅状态（status）对比
+
+| 维度 | 手动表单保存（[Customers.php L284-L290](file:///d:/fz/0601-1/solo-dogfeeding/code/18-opensourcepos/app/Controllers/Customers.php#L284-L290)） | CSV 导入（[Customers.php L473](file:///d:/fz/0601-1/solo-dogfeeding/code/18-opensourcepos/app/Controllers/Customers.php#L473)） |
+|-----|-----------------------------------------------------------------|-----------------------------------------------------------------|
+| 状态值来源 | `$this->request->getPost('mailchimp_status')` | **参数错位 Bug**：实际传的是 `$person_data['last_name']`（姓氏） |
+| 空值处理 | `$mailchimp_status == null ? "" : $mailchimp_status` | （错位后）姓氏非空字符串 |
+| 可选值 | subscribed / pending / unsubscribed / cleaned（[form.php L338-L343](file:///d:/fz/0601-1/solo-dogfeeding/code/18-opensourcepos/app/Views/customers/form.php#L338-L343)） | 无限制，传什么算什么 |
+
+**`status_if_new` 隐藏行为：**
+
+在 `addOrUpdateMember()` 方法内部（[Mailchimp_lib.php L330](file:///d:/fz/0601-1/solo-dogfeeding/code/18-opensourcepos/app/Libraries/Mailchimp_lib.php#L330)），硬编码了 `'status_if_new' => 'subscribed'`：
+- 对**已有成员**：使用传入的 `status` 参数更新状态
+- 对**新成员**：如果 `status` 为空或无效，使用 `status_if_new`（即 `subscribed`）作为初始状态
+- 这意味着即使 `status` 参数传错了（比如传了姓氏），新成员仍然可能因为 `status_if_new` 而被正确订阅
+
+#### 9.5.2 VIP 参数对比
+
+| 维度 | 手动表单保存 | CSV 导入 |
+|-----|-------------|---------|
+| 参数位置 | 第 6 个参数 `['vip' => $this->request->getPost('mailchimp_vip') != null]` | **未传入**，使用默认空数组 |
+| 表单控件 | 复选框 `mailchimp_vip`（[form.php L351-L354](file:///d:/fz/0601-1/solo-dogfeeding/code/18-opensourcepos/app/Views/customers/form.php#L351-L354)） | 无对应 CSV 列 |
+| 参数传递方式 | 通过 `$parameters +=` 合并到请求体（[Mailchimp_lib.php L327-L335](file:///d:/fz/0601-1/solo-dogfeeding/code/18-opensourcepos/app/Libraries/Mailchimp_lib.php#L327-L335)） | 参数数组为空，不包含 vip 字段 |
+
+**`$parameters +=` 合并机制详解：**
+
+```php
+// [Mailchimp_lib.php L327-L335](file:///d:/fz/0601-1/solo-dogfeeding/code/18-opensourcepos/app/Libraries/Mailchimp_lib.php#L327-L335)
+$parameters += [
+    'email_address' => $email,
+    'status'        => $status,
+    'status_if_new' => 'subscribed',
+    'merge_fields'  => [
+        'FNAME' => $first_name,
+        'LNAME' => $last_name
+    ]
+];
+```
+
+- `+=` 是**数组差集合并**：只在调用方没传某个键时才用默认值填充
+- 调用方传入的键（如 `vip`）会原样保留，不会被覆盖
+- 最终整个 `$parameters` 数组作为 JSON 请求体发送给 Mailchimp API
+
+#### 9.5.3 完整参数差异表
+
+| 参数 | 手动表单 | CSV 导入（修正前） | 修正后 CSV 导入应有 |
+|-----|---------|-------------------|-------------------|
+| list_id | `$this->_list_id` | `$this->_list_id` ✅ | `$this->_list_id` |
+| email | `$email` | `$person_data['email']` ✅ | `$person_data['email']` |
+| first_name | `$first_name` | `$person_data['first_name']` ✅ | `$person_data['first_name']` |
+| last_name | `$last_name` | ❌ `''`（空） | `$person_data['last_name']` |
+| status | `$mailchimp_status`（表单下拉） | ❌ `$person_data['last_name']`（错位） | `'subscribed'` 或新增列 |
+| vip | `mailchimp_vip` 复选框值 | ❌ 未传入（默认无） | 新增 CSV 列或默认 false |
+
+### 9.6 失败静默
 
 - `addOrUpdateMember()` 返回值**未被检查**，Mailchimp 同步失败不影响客户保存结果
 - 没有错误日志、没有重试机制
 - 如果 Mailchimp 未配置（API Key 或 List ID 为空），API 调用直接返回 `false`，同样静默忽略（见 [Mailchimp_lib.php L71-L78](file:///d:/fz/0601-1/solo-dogfeeding/code/18-opensourcepos/app/Libraries/Mailchimp_lib.php#L71-L78)）
+- 同步失败不会导致客户导入回滚，数据一致性完全依赖外部人工检查
 
 ---
 
