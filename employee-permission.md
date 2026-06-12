@@ -1,5 +1,21 @@
 # OSPOS 员工权限拦截机制梳理
 
+## 文档说明与已知分歧
+
+本文件结合代码实现对登录会话、模块授权、过期重定向进行梳理。初次梳理时存在多处与代码不符的结论，已在本次修订中纠正：
+
+1. **报表权限的双重校验**：`Reports` 控制器并非只做一次模块级授权，而是在父类 `Secure_Controller` 阶段 1 之后，又在自己的构造函数里通过正则解析 URL 做了阶段 2 的子权限精确校验（`reports_sales` / `reports_customers` 等）。两阶段串联执行，缺一不可。详见 3.7 节。
+
+2. **主权限与子权限的放行关系**：`has_module_grant()` 的判定不能简单概括为"主权限放行"或"子权限放行"。它实际依据 `grants` 表前缀匹配的**条数**做分支，且 `has_subpermissions()` 方法名与返回值语义**完全反向**（返回 `true` 表示"没有子权限定义"）。对于有子权限定义的模块，只配 1 条 grant（无论是主权限还是单条子权限）都会被拦截，必须 ≥2 条前缀匹配才能通过。详见 3.3 节完整判定表。
+
+3. **登出入口的可达性**：代码中共出现四处"登出"相关定义（`Home::getLogout()`、`Office::logout()`、`header_js.php` 的 AJAX、`Employee::logout()` 本身），但用户实际能触发到的**只有 `Home::getLogout()` 一处**。其余三处因方法名无 HTTP 动词前缀、DOM 选择器无法匹配、纯方法无路由映射等原因均不可达。详见 2.4 节。
+
+4. **子权限定义分布不全**：初次梳理仅列出 `reports`、`sales` 两个有子权限定义的模块。实际上 `items`、`receivings` 模块也有子权限（位置子权限，按仓库动态生成），因此受 `has_subpermissions` 影响的主模块共 4 个。详见 3.3.1 节。
+
+5. **权限的三维分类体系**：权限不仅有"主权限/子权限"之分，子权限内部还分为"功能子权限"（如 `sales_change_price`）和"位置子权限"（如 `items_stock`），后者与仓库位置动态联动。详见 3.3.1 节完整分类。
+
+---
+
 ## 一、整体架构：控制器继承链
 
 OSPOS 的权限控制采用 **控制器继承 + 构造函数拦截** 的模式，而非 CodeIgniter 4 标准的 Filter 中间件。继承关系如下：
@@ -198,7 +214,121 @@ public function has_subpermissions(string $permission_id): bool
 |---|---|---|
 | `reports` | ✅ 有 | `reports_customers`, `reports_receivings`, `reports_items`, `reports_employees`, `reports_suppliers`, `reports_sales`, `reports_discounts`, `reports_taxes`, `reports_sales_taxes`, `reports_inventory`, `reports_categories`, `reports_payments`, `reports_expenses_categories` |
 | `sales` | ✅ 有 | `sales_change_price`, `sales_delete` |
-| `customers`, `employees`, `giftcards`, `items`, `item_kits`, `messages`, `receivings`, `config`, `suppliers`, `cashups`, `expenses`, `expenses_categories`, `taxes`, `tax_codes`, `tax_categories`, `tax_jurisdictions`, `attributes`, `office`, `home` | ❌ 无 | — |
+| `items` | ✅ 有 | `items_stock`, `items_{location_name}`（按仓库动态生成） |
+| `receivings` | ✅ 有 | `receivings_stock`, `receivings_{location_name}`（按仓库动态生成） |
+| `customers`, `employees`, `giftcards`, `item_kits`, `messages`, `config`, `suppliers`, `cashups`, `expenses`, `expenses_categories`, `taxes`, `tax_codes`, `tax_categories`, `tax_jurisdictions`, `attributes`, `office`, `home` | ❌ 无 | — |
+
+---
+
+### 3.3.1 权限的三维分类体系与命名关联
+
+`permissions` 表的设计实际上包含三个维度的分类，理解这一点才能完整把握判定边界。
+
+#### 表结构与三维分类
+
+`permissions` 表的关键字段：
+| 字段 | 类型 | 作用 |
+|---|---|---|
+| `permission_id` | varchar(255) | 权限唯一标识，主键 |
+| `module_id` | varchar(255) | 所属模块，外键关联 `modules` 表 |
+| `location_id` | int(10) | 关联仓库位置，外键关联 `stock_locations`，可为 NULL |
+
+基于这三个字段，权限可分为三大类：
+
+```
+权限体系
+  ├─ 主权限：permission_id == module_id，location_id = NULL
+  │     如：items, sales, receivings, reports, customers, ...
+  │
+  └─ 子权限：permission_id = {module}_{sub_name}
+        ├─ 功能子权限：location_id = NULL
+        │     如：sales_change_price, sales_delete, reports_sales
+        │     由迁移脚本静态定义，与仓库无关
+        │
+        └─ 位置子权限：location_id != NULL
+              如：items_stock, sales_warehouse2, receivings_stock
+              由 Stock_location 模型在新增/修改仓库时动态生成
+```
+
+**命名规则与关联关系**：
+
+| 权限类型 | permission_id 格式 | module_id | location_id | 判定方式 |
+|---|---|---|---|---|
+| 主权限 | `{module}` | = permission_id | NULL | `has_module_grant` 前缀统计的基准 |
+| 功能子权限 | `{module}_{function}` | = `{module}` | NULL | `has_grant` 精确匹配 |
+| 位置子权限 | `{module}_{location_name}` | = `{module}` | 非 NULL | `get_allowed_locations` JOIN 查询 |
+
+#### `has_subpermissions()` 的判定边界
+
+`has_subpermissions($permission_id)` 查询 `permissions` 表中 `permission_id LIKE '{$permission_id}_%'` 的记录数，**不区分功能子权限还是位置子权限**。只要返回 >0，就认为"存在子权限定义"。
+
+这意味着：
+- `has_subpermissions('items')` → 能匹配到 `items_stock`、`items_warehouse2` 等 → 返回 `false`（有子权限定义）
+- `has_subpermissions('receivings')` → 能匹配到 `receivings_stock` 等 → 返回 `false`
+- `has_subpermissions('sales')` → 能匹配到 `sales_change_price`、`sales_delete`、`sales_stock` → 返回 `false`
+- `has_subpermissions('reports')` → 能匹配到 `reports_sales` 等 → 返回 `false`
+- `has_subpermissions('customers')` → 没有任何前缀匹配 → 返回 `true`（无子权限定义）
+
+⚠️ **重要修正**：受 `has_subpermissions` 影响的主模块共 **4 个**（`reports`、`sales`、`items`、`receivings`），不是 2 个。`items` 和 `receivings` 虽然没有功能子权限，但有位置子权限，同样会影响 `has_module_grant` 的放行判定。
+
+#### 位置子权限的动态生成机制
+
+位置子权限不是在迁移脚本中硬编码的，而是在运行时由 [Stock_location::save_value()](file:///d:/fz/0601-1/solo-dogfeeding/code/15-opensourcepos/app/Models/Stock_location.php#L176-L257) 动态维护：
+
+**新增仓库时**（L182-L206）：
+1. 插入 `stock_locations` 表，获取新的 `location_id`
+2. 调用 `_insert_new_permission()` 为 `items`、`sales`、`receivings` 三个模块各生成一条位置子权限
+3. 权限 ID 规则：`{module}_{location_name}`（空格替换为下划线）
+4. 为所有现有员工自动在 `grants` 表中分配该位置权限，继承对应模块主权限的 `menu_group`
+5. 为所有现有商品在 `item_quantities` 表中初始化该仓库的库存为 0
+
+**修改仓库名时**（L213-L222）：
+1. 删除旧 `location_id` 对应的所有 `permissions` 记录（级联删除 `grants`）
+2. 用新 `location_name` 重新生成 `items_{new_name}`、`sales_{new_name}`、`receivings_{new_name}` 三条权限
+3. 重新分配给所有员工
+
+**删除仓库时**（[Config.php:L741](file:///d:/fz/0601-1/solo-dogfeeding/code/15-opensourcepos/app/Controllers/Config.php#L741)）：
+1. 调用 `stock_location->delete($location_id)`
+2. 由于 `permissions` 表 `location_id` 外键设置 `ON DELETE CASCADE`，删除仓库时自动级联删除关联的位置子权限和 grants
+
+#### 位置权限在业务代码中的使用方式
+
+位置子权限**不通过 `has_grant()` 直接调用**，而是通过 `Stock_location` 模型的一组方法做 JOIN 查询来过滤可见范围：
+
+**核心方法**：[Stock_location::get_allowed_locations()](file:///d:/fz/0601-1/solo-dogfeeding/code/15-opensourcepos/app/Models/Stock_location.php#L100-L110)
+
+```php
+public function get_allowed_locations(string $module_id = 'items'): array
+{
+    // 内部调用 get_undeleted_all()，三表 JOIN：
+    // stock_locations ➜ permissions (location_id 关联) ➜ grants (permission_id 关联)
+    // WHERE person_id = 当前登录用户 AND permission_id LIKE '{module_id}%'
+}
+```
+
+**使用场景**：
+
+| 调用位置 | module_id | 作用 |
+|---|---|---|
+| [Items.php:L80](file:///d:/fz/0601-1/solo-dogfeeding/code/15-opensourcepos/app/Controllers/Items.php#L80) | `items` | 商品管理页面仓库下拉框过滤 |
+| [Items.php:L958](file:///d:/fz/0601-1/solo-dogfeeding/code/15-opensourcepos/app/Controllers/Items.php#L958) | `items` | CSV 导出时仅导出有权限的仓库 |
+| [Items.php:L992](file:///d:/fz/0601-1/solo-dogfeeding/code/15-opensourcepos/app/Controllers/Items.php#L992) | `items` | CSV 导入时校验仓库权限 |
+| [Sales.php:L1208](file:///d:/fz/0601-1/solo-dogfeeding/code/15-opensourcepos/app/Controllers/Sales.php#L1208) | `sales` | POS 收银台仓库选择过滤 |
+| [Receivings.php:L461](file:///d:/fz/0601-1/solo-dogfeeding/code/15-opensourcepos/app/Controllers/Receivings.php#L461) | `receivings` | 采购收货仓库选择过滤 |
+| 多处 Reports 控制器方法 | `sales` / `receivings` / `items` | 报表仓库范围过滤 |
+
+还有一个配套方法 `is_allowed_location($location_id, $module_id)` 用于单条权限校验，在提交数据时二次验证。
+
+#### 对实际权限分配的影响
+
+| 场景 | has_module_grant 结果 | 菜单显示 | 仓库下拉可见性 |
+|---|---|---|---|
+| 只配 `items` 主权限（无子权限） | 前缀匹配 1 条 + 有子权限定义 → ❌ 拦截 | ✅ 显示（有主权限） | —（进不去） |
+| 配 `items` + `items_stock`（单仓库） | 前缀匹配 2 条 → ✅ 放行 | ✅ 显示 | 只能看到 stock 仓库 |
+| 配 `items_stock` + `items_warehouse2`（两个位置权限，不配主权限） | 前缀匹配 2 条 → ✅ 放行 | ❌ 不显示（无主权限 JOIN 不出来） | 能看到 stock 和 warehouse2 |
+| 配 `items` + `items_stock` + `items_warehouse2` | 前缀匹配 3 条 → ✅ 放行 | ✅ 显示 | 能看到两个仓库 |
+
+这就是 `items`、`receivings` 模块最容易踩坑的地方：**只分配主权限会被拦在控制器外**，必须同时分配至少一个位置子权限才能进入模块。
 
 ---
 
