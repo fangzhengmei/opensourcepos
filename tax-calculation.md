@@ -334,12 +334,34 @@ foreach ($tax_definition as $tax) {
 
 ### 7.3 舍入时机与边界
 
-税费计算采用 **「分项精确累加 + 最终统一舍入」** 的策略：
+税费计算采用 **「分项精确累加 + 最终统一舍入」** 的整体策略，但**价内税和价外税的单项舍入行为完全不同**。
+
+#### 7.3.1 BC Math 全局精度
+
+所有 `bc*` 函数的运算精度由全局设置决定，见 [Load_config.php](file:///d:/fz/0601-1/solo-dogfeeding/code/17-opensourcepos/app/Events/Load_config.php#L44)：
+
+```php
+bcscale(max(2, totals_decimals() + tax_decimals()));
+```
+
+这意味着所有高精度运算（`bcmul`、`bcdiv`、`bcadd`、`bcsub`）默认使用 `max(2, currency_decimals + tax_decimals)` 位小数，通常为 4 位。
+
+#### 7.3.2 完整舍入流程
 
 ```
-阶段 1：单项计算（不做最终舍入）
-  ├─ 基础税制：每个商品的每个税种使用 tax_decimals 精度单项舍入
-  └─ 目的地税制：每个商品的每个税种使用 tax_decimals 精度单项舍入
+阶段 0：全局精度设置
+  └─ bcscale(max(2, totals_decimals() + tax_decimals())) — 默认 4 位小数
+
+阶段 1：单项税额计算（价内/价外差异最大）
+  ├─ 价外税（Excluded Tax）：
+  │    计算：bcmul(tax_basis, bcdiv(tax_rate, 100))
+  │    舍入：调用 round_number(rounding_mode, tax_amount, tax_decimals)
+  │          按 tax_decimals 做单项舍入，触发 HALF_ODD/HALF_FIVE 逻辑
+  │
+  └─ 价内税（Included Tax）：
+       计算：item_total - (item_total / (1 + tax_rate/100))
+       舍入：无单项舍入！get_included_tax() 的 $tax_decimal 和 $rounding_code 参数未使用
+             结果为 bc 运算的高精度值（通常 4 位小数）
 
 阶段 2：按税种分组累加（4 位小数精度）
   └─ update_taxes() 中 bcadd(..., ..., 4)，见 Tax_lib.php#L223-L224
@@ -348,15 +370,16 @@ foreach ($tax_definition as $tax) {
 
 阶段 3：最终统一舍入（按税种分组）
   └─ round_taxes() 中对每个税种分组的总税额做最终舍入
-     精度：tax_included ? tax_decimals : currency_decimals
+     精度：由全局配置 tax_included 决定
+           tax_included = true  → 使用 tax_decimals
+           tax_included = false → 使用 currency_decimals
+     模式：使用该税种的 rounding_code，但触发 round_taxes() 中的另一套实现
 ```
 
-**这意味着**：
-- 单项税额在计算时以高精度累加（4 位小数）
-- 最终打印/记账时才按配置的小数位做舍入
+**关键差异总结**：
+- **价外税**：经历两次舍入（单项舍入 + 最终舍入），单项舍入会触发 HALF_ODD/HALF_FIVE 逻辑
+- **价内税**：只经历一次舍入（仅最终舍入），单项阶段完全不做舍入
 - 同一税种的所有商品税额会先求和、后舍入（而非每个商品先舍入、后求和）
-
-这种策略减少了多次舍入的累积误差。
 
 ### 7.4 舍入边界示例
 
