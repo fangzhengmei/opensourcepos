@@ -332,6 +332,175 @@ public function get_allowed_locations(string $module_id = 'items'): array
 
 ---
 
+### 3.4 权限来源链条：静态预置与运行时扩展
+
+`permissions` 表中的权限记录并非全部由迁移脚本一次性预置，而是分为"**静态预置**"和"**运行时扩展**"两大来源，两者覆盖的范围完全不同。理解这一点才能正确定位权限缺失或冗余的问题。
+
+#### 来源全景图
+
+```
+权限来源体系
+  ├─ 静态预置（迁移脚本执行时写入，运行时只读）
+  │    ├─ 初始安装：initial_schema.sql
+  │    ├─ 版本升级：2.3_to_2.3.1.sql
+  │    ├─ 版本升级：2.3.1_to_2.3.2.sql（INSERT IGNORE 补齐缺失位置权限）
+  │    ├─ 版本升级：2.4_to_3.0.sql（新增 messages 模块）
+  │    ├─ 版本升级：3.0.2_to_3.1.1.sql（新增 taxes、migrate 模块）
+  │    ├─ 版本升级：3.1.1_to_3.2.0.sql（新增 office/home 菜单、sales_delete、
+  │    │                               expenses、reports_expenses_categories，移除 migrate）
+  │    ├─ 版本升级：3.2.1_to_3.3.0.sql
+  │    ├─ 版本升级：3.3.0_attributes.sql（新增 attributes 模块）
+  │    ├─ 版本升级：3.3.0_indiagst.sql（新增 reports_sales_taxes 子权限）
+  │    └─ 版本升级：3.3.2_saleschangeprice.sql（新增 sales_change_price 子权限）
+  │
+  └─ 运行时扩展（用户在管理界面操作时动态写入）
+       ├─ 新增仓库 → _insert_new_permission() 自动生成 items/sales/receivings
+       │               三个模块的位置子权限 + 为所有员工分配 grant
+       ├─ 重命名仓库 → 删除旧 location_id 权限 → 用新名称重建三条权限 + 重新分配 grants
+       └─ 删除仓库 → 外键 ON DELETE CASCADE 自动级联删除位置权限和 grants
+```
+
+#### 静态预置的覆盖范围
+
+**静态预置 = 迁移脚本中的 `INSERT INTO ospos_permissions`**，只在数据库迁移阶段执行一次，后续运行时不再变化（除非后续版本升级的迁移脚本再次补充）。
+
+预置的权限按类型覆盖如下：
+
+| 类型 | 预置覆盖的模块 | 具体权限示例 | 对应迁移脚本 |
+|---|---|---|---|
+| **主权限**（21 个） | 全部模块 | `items`, `sales`, `receivings`, `reports`, `customers`, `employees`, `giftcards`, `item_kits`, `messages`, `config`, `suppliers`, `taxes`, `cashups`, `expenses`, `expenses_categories`, `tax_codes`, `tax_categories`, `tax_jurisdictions`, `attributes`, `office`, `home` | 多处迁移累积 |
+| **功能子权限**（18 个） | 仅 `reports`、`sales` | `reports_customers`(11条) + `reports_discounts`, `reports_taxes`, `reports_sales_taxes`, `reports_expenses_categories` + `sales_delete`, `sales_change_price` | initial_schema.sql → 3.1.1 → 3.3.0 → 3.3.2 |
+| **位置子权限**（3 条 / 每仓库） | `items`、`sales`、`receivings` | **仅初始默认仓库 `stock`** 的 3 条：`items_stock`、`sales_stock`、`receivings_stock` | initial_schema.sql:L396-L399 |
+
+⚠️ **静态预置对位置子权限仅覆盖默认仓库 `stock`**。任何后续新增的仓库（如 `warehouse2`、`shop_floor`）的位置子权限**不会**出现在迁移脚本中，必须靠运行时动态生成。
+
+#### 运行时扩展的触发入口与代码路径
+
+运行时扩展全部围绕 **仓库（Stock Location）管理**展开，只有一个触发源：系统管理员在【设置 → 仓库配置】页面的操作。
+
+**触发入口**：[Config::postSaveLocations()](file:///d:/fz/0601-1/solo-dogfeeding/code/15-opensourcepos/app/Controllers/Config.php#L717-L750)
+
+用户在仓库配置页面的前端表单提交后，遍历 POST 数据中的 `stock_location[$location_id] = $location_name` 数组，对每个仓库调用：
+
+```php
+$this->stock_location->save_value($location_data, $location_id);
+```
+
+#### save_value() 中的三条扩展路径
+
+[Stock_location::save_value()](file:///d:/fz/0601-1/solo-dogfeeding/code/15-opensourcepos/app/Models/Stock_location.php#L176-L228) 根据 `$location_id` 是否存在和 `location_name` 是否变更，分三种行为：
+
+**路径 A：新增仓库**（`!exists($location_id)`）
+
+[L182-L210](file:///d:/fz/0601-1/solo-dogfeeding/code/15-opensourcepos/app/Models/Stock_location.php#L182-L210)，在一个数据库事务中依次执行：
+
+```
+① 插入 stock_locations → 获取新 location_id
+② 调用 _insert_new_permission() 三次（items / sales / receivings）
+   ├─ 生成 permission_id = "{module}_{location_name}"（空格替换为下划线）
+   ├─ 写入 permissions 表（module_id、location_id 关联）
+   ├─ 遍历所有现有员工，在 grants 表中每人插入 3 条 grant
+   │   └─ menu_group 继承对应模块主权限（items/sales/receivings）的 menu_group
+   └─ 位置子权限共生成 3 × N 条 grant（N 为员工数）
+③ 遍历所有现有商品，在 item_quantities 表初始化该仓库库存 = 0
+④ 提交事务
+```
+
+关键方法 [_insert_new_permission()](file:///d:/fz/0601-1/solo-dogfeeding/code/15-opensourcepos/app/Models/Stock_location.php#L236-L257)：
+- 权限命名：`$module . '_' . str_replace(' ', '_', $location_name)`
+- **全量分配**：为**所有**现有员工自动授予新位置权限，没有例外
+- menu_group 复制逻辑：调用 `get_menu_group($module, $employee['person_id'])` 取主权限的 menu_group
+
+**路径 B：重命名仓库**（名称变更但 location_id 不变）
+
+[L213-L222](file:///d:/fz/0601-1/solo-dogfeeding/code/15-opensourcepos/app/Models/Stock_location.php#L213-L222)：
+
+```
+① DELETE FROM permissions WHERE location_id = $location_id
+   → 外键 ON DELETE CASCADE 自动删除所有员工对应的 grants 记录
+② 调用 _insert_new_permission() 三次，用新 location_name 重建权限
+   → 再次为所有员工插入 grants（menu_group 策略同新增）
+③ 更新 stock_locations.location_name
+```
+
+⚠️ **关键约束**：重命名 = 先全删再全建，期间如果事务失败会导致员工丢失该仓库的所有位置权限（但事务回滚可恢复）。同时由于 permission_id 是 `{module}_{name}`，只要名称变更，旧权限 ID 就无法被任何代码查询命中。
+
+**路径 C：删除仓库**（POST 中未包含的 location_id）
+
+由 [Config::postSaveLocations():L737-L743](file:///d:/fz/0601-1/solo-dogfeeding/code/15-opensourcepos/app/Controllers/Config.php#L737-L743) 处理：
+
+```
+① 调用 stock_location->delete($location_id)
+② stock_locations 表记录标记 deleted=1（软删除）
+③ permissions 表 location_id 外键 ON DELETE CASCADE
+   → 自动删除该 location_id 关联的 3 条 permissions 记录
+④ grants 表 permission_id 外键 ON DELETE CASCADE
+   → 自动级联删除所有员工该仓库的 grants
+```
+
+#### 迁移脚本对位置子权限的兼容处理
+
+版本升级的迁移脚本对"可能存在的额外仓库"做了兼容处理，避免老系统升级时因自定义仓库缺少位置权限导致所有员工 `has_module_grant('items')` 被拦截。
+
+[2.3.1_to_2.3.2.sql:L31-L35](file:///d:/fz/0601-1/solo-dogfeeding/code/15-opensourcepos/app/Database/Migrations/sqlscripts/pre-3.0.2/2.3.1_to_2.3.2.sql#L31-L35)：
+
+```sql
+INSERT IGNORE INTO ospos_permissions (permission_id, module_id, location_id)
+(SELECT CONCAT('sales_', location_name), 'sales', location_id FROM ospos_stock_locations);
+
+INSERT IGNORE INTO ospos_permissions (permission_id, module_id, location_id)
+(SELECT CONCAT('receivings_', location_name), 'receivings', location_id FROM ospos_stock_locations);
+```
+
+⚠️ 注意：**`items` 模块的补齐 SQL 放在 2.3_to_2.3.1.sql 的 L42-L43**，而 `sales` 和 `receivings` 放在下一个版本脚本中。两者使用 `INSERT IGNORE` 避免重复键冲突，但**只补 permissions 表，不补 grants 表**——这意味着如果在版本 2.3.1 之前创建了自定义仓库并在 2.3.1 期间升级到 2.3.2，自定义仓库的位置子权限定义会被补齐，但员工的 grants 仍需手动重新分配（或触发一次仓库重命名来重建）。
+
+#### 员工编辑时权限表单的查询逻辑
+
+运行时扩展的权限最终在员工编辑界面被消费，相关查询链路如下：
+
+**权限表单渲染**（[Employees::getView()](file:///d:/fz/0601-1/solo-dogfeeding/code/15-opensourcepos/app/Controllers/Employees.php#L75-L110)）：
+- 主权限复选框：调用 `module->get_all_modules()` 遍历所有模块 → 用 `has_grant($module->module_id)` 判断勾选
+- 子权限复选框：调用 `module->get_all_subpermissions()` → 包含**所有**子权限（功能子权限 + 位置子权限）
+
+`get_all_subpermissions()` 的查询条件很特殊（[Module.php:L72-L81](file:///d:/fz/0601-1/solo-dogfeeding/code/15-opensourcepos/app/Models/Module.php#L72-L81)）：
+
+```php
+$builder->join('modules AS modules', 'modules.module_id = permissions.module_id');
+$builder->where('modules.module_id != ', 'permission_id', false);
+// 即：permissions.permission_id != permissions.module_id
+// 因为 modules.module_id = permissions.module_id（JOIN 条件）
+// 等价于 WHERE permissions.permission_id != permissions.module_id
+```
+
+⚠️ **这个判断条件实际上是"permission_id 不等于 module_id"**——即以 "_" 命名分离的权限记录（无论是功能子权限还是位置子权限）都会被筛选为"子权限"。
+
+**权限保存**（[Employees::postSave()](file:///d:/fz/0601-1/solo-dogfeeding/code/15-opensourcepos/app/Controllers/Employees.php#L155-L170)）：
+
+```php
+foreach ($this->module->get_all_permissions()->getResult() as $permission) {
+    // 读取 POST['grant_' . $permission->permission_id]
+    // 如果勾选了（值 == permission_id），写入 grants_array
+    // 非 admin 不能分配自己没有的权限
+}
+```
+
+保存时调用 `Employee::save_employee()` → **先 DELETE 该员工所有 grants → 再逐条 INSERT**，这是一个整体替换操作。如果管理员自己的 `items_warehouse2` 位置权限被人撤销了，他下次保存员工时也无法再分配该权限（L163 的 `has_grant` 二次检查）。
+
+#### 两种来源的覆盖范围汇总表
+
+| 维度 | 静态预置（迁移脚本） | 运行时扩展（仓库操作） |
+|---|---|---|
+| **执行时机** | `php spark migrate` 执行期间 | 管理员在 Config → 仓库配置页面提交表单时 |
+| **权限类型** | 主权限（全部）+ 功能子权限（全部）+ 默认仓库 `stock` 的 3 条位置子权限 | 非默认仓库的 items/sales/receivings 位置子权限 |
+| **写入 permissions** | ✅ 是 | ✅ 是（新增/重命名时）+ ❌ 自动删除（删除仓库时级联） |
+| **写入 grants** | 仅 person_id=1（超级管理员）的预置 grants | ✅ 为所有员工自动分配对应模块主权限的 menu_group |
+| **可变性** | 运行时只读，除非再次执行 `migrate` 升级 | 新增/重命名/删除仓库时动态变化 |
+| **命名规则** | 固定写死在 SQL 文件中 | `{module}_{location_name}`，空格替换为下划线 |
+| **权限 ID 稳定性** | 稳定，版本间不变 | 仓库改名时权限 ID 会变化（旧的删除，新的重建） |
+| **遗漏风险** | 版本升级时若 `INSERT IGNORE` 跳过，可手动重跑迁移 | 老系统升级（2.3 → 2.3.1）时自定义仓库可能缺 grants，需手动重命名仓库一次触发重建 |
+
+---
+
 ### 3.7 报表控制器的双重校验
 
 `Reports` 控制器的权限检查是**两阶段**串联执行，这是整个系统中最复杂的授权路径，也是最容易理解错的地方。
