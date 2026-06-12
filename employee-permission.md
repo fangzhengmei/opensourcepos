@@ -427,15 +427,93 @@ $this->stock_location->save_value($location_data, $location_id);
 
 **路径 C：删除仓库**（POST 中未包含的 location_id）
 
-由 [Config::postSaveLocations():L737-L743](file:///d:/fz/0601-1/solo-dogfeeding/code/15-opensourcepos/app/Controllers/Config.php#L737-L743) 处理：
+由 [Config::postSaveLocations():L736-L743](file:///d:/fz/0601-1/solo-dogfeeding/code/15-opensourcepos/app/Controllers/Config.php#L736-L743) 处理：
+
+`get_all()` 查询 `WHERE deleted=0`，只返回未删除的仓库。POST 中未出现的 location_id 即为待删除目标，调用 `stock_location->delete($location_id)`。
+
+[Stock_location::delete()](file:///d:/fz/0601-1/solo-dogfeeding/code/15-opensourcepos/app/Models/Stock_location.php#L269-L283) 的实际实现（⚠️ 与外键级联的常见理解有偏差）：
 
 ```
-① 调用 stock_location->delete($location_id)
-② stock_locations 表记录标记 deleted=1（软删除）
-③ permissions 表 location_id 外键 ON DELETE CASCADE
-   → 自动删除该 location_id 关联的 3 条 permissions 记录
-④ grants 表 permission_id 外键 ON DELETE CASCADE
-   → 自动级联删除所有员工该仓库的 grants
+① UPDATE stock_locations SET deleted=1 WHERE location_id=?
+   → 软删除，行仍然存在
+
+② DELETE FROM permissions WHERE location_id=?
+   → 显式删除该仓库关联的 3 条位置子权限（items_*/sales_*/receivings_*）
+
+③ grants 由外键级联自动清理：
+   → permissions 行被 ② 显式删除后，
+   → grants_ibfk_1 (permission_id → permissions.permission_id ON DELETE CASCADE) 触发，
+   → 自动删除所有员工该仓库的 grants 记录
+```
+
+#### 删除链条中外键级联的真实生效位置
+
+数据库中涉及三张表的外键约束定义如下（[initial_schema.sql:L779-L788](file:///d:/fz/0601-1/solo-dogfeeding/code/15-opensourcepos/app/Database/Migrations/sqlscripts/initial_schema.sql#L779-L788)）：
+
+```sql
+-- permissions 表的外键
+ALTER TABLE ospos_permissions
+  ADD CONSTRAINT ospos_permissions_ibfk_1
+    FOREIGN KEY (module_id) REFERENCES ospos_modules (module_id) ON DELETE CASCADE,
+  ADD CONSTRAINT ospos_permissions_ibfk_2
+    FOREIGN KEY (location_id) REFERENCES ospos_stock_locations (location_id) ON DELETE CASCADE;
+
+-- grants 表的外键
+ALTER TABLE ospos_grants
+  ADD CONSTRAINT ospos_grants_ibfk_1
+    FOREIGN KEY (permission_id) REFERENCES ospos_permissions (permission_id) ON DELETE CASCADE,
+  ADD CONSTRAINT ospos_grants_ibfk_2
+    FOREIGN KEY (person_id) REFERENCES ospos_employees (person_id) ON DELETE CASCADE;
+```
+
+⚠️ **关键分歧：`permissions_ibfk_2`（location_id → stock_locations.location_id ON DELETE CASCADE）在删除仓库场景中实际不触发。** 原因是 `Stock_location::delete()` 对 `stock_locations` 做的是 **UPDATE**（`SET deleted=1`），而非 **DELETE**。该行仍存在于表中，只是 `deleted` 字段从 0 变为 1。因此 `permissions_ibfk_2` 这个外键级联在仓库删除路径中永远不会被激活。
+
+删除链条中实际触发的外键级联**只有一条**：`grants_ibfk_1`（grants.permission_id → permissions.permission_id ON DELETE CASCADE），在 ② 显式 `DELETE FROM permissions WHERE location_id=?` 之后自动触发。
+
+完整的三表删除链路：
+
+```
+Stock_location::delete() 内部事务（L271-L280）
+  │
+  ├─ ① UPDATE stock_locations SET deleted=1
+  │     → stock_locations 行保留，permissions_ibfk_2 不触发
+  │
+  ├─ ② DELETE FROM permissions WHERE location_id=?
+  │     → 显式删除 3 条位置子权限
+  │     → 触发 grants_ibfk_1 ON DELETE CASCADE
+  │        → 自动删除所有关联的 grants 记录
+  │
+  └─ 事务提交/回滚
+```
+
+⚠️ 另一个需要注意的点：`Stock_location::delete()` 内部自行调用了 `$this->db->transStart()` 和 `$this->db->transComplete()`，而 `Config::postSaveLocations()` 的外层也包裹了事务。CI4/CodeIgniter 的嵌套事务机制下，内层 `transStart()` 实际只设置 savepoint，外层 `transComplete()` 才真正提交。因此整个仓库配置保存操作（新增 + 修改 + 删除）是**原子性的**：任一步失败则全部回滚。
+
+#### 事务边界图
+
+```
+Config::postSaveLocations()  ─── 外层事务 ─────────────────────────────────┐
+  │                                                                        │
+  ├─ 遍历 POST 中的仓库：save_value()                                      │
+  │    ├─ 新增仓库 → 内层事务（savepoint）                                  │
+  │    │    ├─ INSERT stock_locations                                       │
+  │    │    ├─ INSERT permissions × 3                                       │
+  │    │    ├─ INSERT grants × (3 × N员工)                                  │
+  │    │    └─ INSERT item_quantities × M商品                               │
+  │    │                                                                    │
+  │    └─ 重命名仓库 → 无内层事务                                           │
+  │         ├─ DELETE permissions WHERE location_id=?                       │
+  │         │   → 级联 DELETE grants                                        │
+  │         ├─ INSERT permissions × 3 + INSERT grants × (3 × N)            │
+  │         └─ UPDATE stock_locations                                       │
+  │                                                                        │
+  ├─ 遍历待删除仓库：delete()                                              │
+  │    └─ 内层事务（savepoint）                                             │
+  │         ├─ UPDATE stock_locations SET deleted=1                         │
+  │         ├─ DELETE permissions WHERE location_id=?                       │
+  │         │   → 级联 DELETE grants                                        │
+  │         └─ [内层 transComplete → release savepoint]                     │
+  │                                                                        │
+  └─ 外层 transComplete → 全部提交 或 全部回滚 ◄───────────────────────────┘
 ```
 
 #### 迁移脚本对位置子权限的兼容处理
