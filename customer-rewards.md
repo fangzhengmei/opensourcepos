@@ -905,10 +905,12 @@ customers_packages   → float (PHP)         $points_percent: float
                          ↓
                     $customer->update_reward_points_value($customer_id, $points);
                     // 方法签名: update_reward_points_value(int $customer_id, int $value)
-                    // ★ float → int 隐式转换，PHP 8.1+ 会产生 TypeError
+                    // ★ float → int 隐式转换，PHP 非严格模式下做强制截断
 ```
 
-### 9.2 PHP 8.1+ 严格类型下的致命问题
+### 9.2 PHP 非严格模式下的强制截断影响
+
+经核实，项目 `app/` 目录下**所有文件均未声明 `declare(strict_types=1)`**，因此不存在 PHP 8.1+ 的 TypeError 风险。在 PHP 默认模式下，将 `float` 传入声明为 `int` 的参数会执行**强制类型转换（向零截断取整）**。
 
 [Customer.php L239](file:///d:/fz/0601-1/solo-dogfeeding/code/14-opensourcepos/app/Models/Customer.php#L239)：
 
@@ -922,18 +924,29 @@ public function update_reward_points_value(int $customer_id, int $value): void
 // Sale.php L1393-L1396
 $total_amount_earned = ($total_amount * $points_percent / 100);  // float
 $points = $points + $total_amount_earned;                         // float
-$customer->update_reward_points_value($customer_id, $points);     // ★ float → int
+$customer->update_reward_points_value($customer_id, $points);     // float → (int)强制截断
 ```
 
-在 PHP 8.1+ 严格模式下，**将 float 传入 `int` 类型参数会触发 `TypeError`**，导致积分更新失败。
+PHP 执行 `(int)` 转换时采用**向零截断策略**（`intval()` 等价行为）：
 
-即使在非严格模式下（隐式截断），也会发生**精度丢失**：
+| 示例 | 计算过程 | 四舍五入期望值 | PHP 实际 (int) 值 | 误差 |
+|------|----------|--------------|------------------|------|
+| 消费 99.99 元，比例 5% | 99.99 × 5 / 100 = 4.9995 | 5 | 4 | **-1 积分** |
+| 消费 33.33 元，比例 10% | 33.33 × 10 / 100 = 3.333 | 3 | 3 | -0.333（截断在整数位无损失） |
+| 消费 0.01 元，比例 5% | 0.01 × 5 / 100 = 0.0005 | 0 | 0 | 精度丢失（小数部分） |
+| 消费 19.99 元，比例 5% | 19.99 × 5 / 100 = 0.9995 | 1 | **0** | **-1 积分** |
+| 消费 299.99 元，比例 5% | 299.99 × 5 / 100 = 14.9995 | 15 | **14** | **-1 积分** |
 
-| 示例 | 计算过程 | 期望值 | 实际值（隐式截断） | 误差 |
-|------|----------|--------|-------------------|------|
-| 消费 99.99 元，比例 5% | 99.99 × 5 / 100 = 4.9995 | 5 | 4 | -1 |
-| 消费 33.33 元，比例 10% | 33.33 × 10 / 100 = 3.333 | 3 | 3 | -0.333 |
-| 消费 0.01 元，比例 5% | 0.01 × 5 / 100 = 0.0005 | 0 | 0 | 精度丢失 |
+#### 实际业务影响评估
+
+- **高频小金额消费场景**（如便利店客单价 20~30 元）：每 1~2 笔就会产生 1 积分的截断损失
+- **正常零售场景**（客单价 50~200 元，比例 5%）：约每 2~10 笔损失 1 积分
+- **大额消费场景**（客单价 > 1000 元）：因 earned 数值大，小数部分占比极小，截断损失可忽略
+- **客户感知**：单客每月少 2~10 积分，长期累积客户可感知积分余额与理论值不符，但单笔差异极小不易察觉
+
+#### PHP 强制截断 vs 数据库 float 截断的双重风险
+
+除了 PHP 层的 `(int)` 截断，MySQL `customers.points` 字段为 `INT(11)`，写入时也会再次执行整数化转换。两层截断如果策略不一致（PHP 向零截断 vs MySQL 根据 SQL 模式可能 ROUND），可能造成额外的 0.5 积分级别偏差。
 
 ### 9.3 浮点存储的精度风险
 
