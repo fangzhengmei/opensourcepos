@@ -6,71 +6,88 @@ OSPOS 系统的收据通知功能目前仅支持**邮件**发送，**短信**功
 
 ---
 
-## 一、邮件收据发送入口
+## 一、邮件收据发送入口：真实路径 vs 死代码
 
-### 1. 结账后自动发送（主要路径）
+### 重要结论
 
-**触发位置**：[receipt.php](file:///d:/fz/0601-1/solo-dogfeeding/code/19-opensourcepos/app/Views/sales/receipt.php#L24-L46)
-
-**触发时机**：销售结账完成后，页面加载时自动执行
-
-**触发条件**（同时满足）：
-- 客户有邮箱地址（`customer_email` 不为空）
-- `email_receipt` 标志为 true
-
-**前端逻辑**：
-```javascript
-// 页面加载后，如果 email_receipt 为 true，则自动调用发送接口
-<?php if (!empty($email_receipt)): ?>
-    send_email();  // 自动调用
-<?php endif; ?>
-```
-
-**调用接口**：`GET /sales/sendPdf/{sale_id}/receipt`
+后端定义了 **2 个**发送邮件的控制器方法，但前端**实际调用的只有 1 个**（`getSendPdf`），另一个（`getSendReceipt`）是死代码，没有任何前端代码调用它。
 
 ---
 
-### 2. 手动点击发送
-
-**触发位置**：收据页面上的"发送收据"按钮
-
-**按钮显示条件**：客户有邮箱地址时才显示
-
-**调用接口**：与自动发送相同，`GET /sales/sendPdf/{sale_id}/receipt`
-
----
-
-### 3. 销售详情页发送
-
-**控制器方法**：[Sales::getSendReceipt()](file:///d:/fz/0601-1/solo-dogfeeding/code/19-opensourcepos/app/Controllers/Sales.php#L983-L1008)
-
-**接口**：`GET /sales/sendReceipt/{sale_id}`
-
-**用途**：从销售管理页面手动重发收据邮件
-
-**特点**：
-- 使用 `receipt_email.php` 作为邮件正文模板（HTML 格式）
-- 不带 PDF 附件
-- 直接嵌入收据内容到邮件正文中
-
----
-
-### 4. PDF 发票/单据发送
+### 1. 真实使用的接口：getSendPdf
 
 **控制器方法**：[Sales::getSendPdf()](file:///d:/fz/0601-1/solo-dogfeeding/code/19-opensourcepos/app/Controllers/Sales.php#L933-L974)
 
 **接口**：`GET /sales/sendPdf/{sale_id}/{type}`
 
-**支持的类型**：
-- `invoice` - 发票（默认）
-- `receipt` - 收据
-- `quote` - 报价单
-- `work_order` - 工单
-
 **特点**：
 - 生成 PDF 作为邮件附件
 - 邮件正文使用 `invoice_email_message` 配置的模板（支持 Token 替换）
 - 支持的 Token：`$INV`（发票号）、`$CO`（销售号）、`$CU`（客户名）
+
+---
+
+### 2. 前端 6 个真实触发点
+
+#### 2.1 结账完成后：5 种单据页面 + 编辑弹窗
+
+所有这些页面都遵循相同的模式：
+- 页面加载时，如果 `email_receipt == true` 且有 `customer_email` → **自动调用**
+- 页面上有"发送邮件"按钮 → **手动调用**
+
+| 页面视图 | 单据类型 | type 参数 | 自动触发条件 | 手动按钮文案 |
+|---|---|---|---|---|
+| [receipt.php](file:///d:/fz/0601-1/solo-dogfeeding/code/19-opensourcepos/app/Views/sales/receipt.php#L24-L58) | 收据 | `receipt` | `email_receipt` 为 true | "发送收据" |
+| [invoice.php](file:///d:/fz/0601-1/solo-dogfeeding/code/19-opensourcepos/app/Views/sales/invoice.php#L32-L72) | 发票 | （默认=invoice） | `email_receipt` 为 true | "发送发票" |
+| [tax_invoice.php](file:///d:/fz/0601-1/solo-dogfeeding/code/19-opensourcepos/app/Views/sales/tax_invoice.php#L32-L71) | 税务发票 | （默认=invoice） | `email_receipt` 为 true | "发送发票" |
+| [quote.php](file:///d:/fz/0601-1/solo-dogfeeding/code/19-opensourcepos/app/Views/sales/quote.php#L28-L67) | 报价单 | `quote` | `email_receipt` 为 true | "发送报价" |
+| [work_order.php](file:///d:/fz/0601-1/solo-dogfeeding/code/19-opensourcepos/app/Views/sales/work_order.php#L33-L70) | 工单 | `work_order` | `email_receipt` 为 true | "发送工单" |
+
+#### 2.2 销售编辑弹窗：form.php
+
+**位置**：[form.php](file:///d:/fz/0601-1/solo-dogfeeding/code/19-opensourcepos/app/Views/sales/form.php#L156-L171)
+
+**触发方式**：
+- 没有自动发送
+- 用户点击按钮 → 弹出确认框 → 确认后调用
+- **需要客户有邮箱**（`$sale_info['email']` 不为空才显示按钮）
+
+**调用接口**：`GET /sales/sendPdf/{sale_id}`（type 默认为 invoice）
+
+**使用场景**：在销售详情/编辑弹窗中手动发送
+
+---
+
+### 3. 死代码：getSendReceipt（前端无调用）
+
+**控制器方法**：[Sales::getSendReceipt()](file:///d:/fz/0601-1/solo-dogfeeding/code/19-opensourcepos/app/Controllers/Sales.php#L983-L1008)
+
+**接口**：`GET /sales/sendReceipt/{sale_id}`
+
+**状态**：**前端无任何调用**，属于死代码/预留接口
+
+**与 getSendPdf 的区别**：
+- 不生成 PDF 附件
+- 直接把收据 HTML 作为邮件正文（使用 `receipt_email.php` 模板）
+- 没有 PDF 附件，只有 HTML 正文
+
+**为什么会存在**：
+- 可能是早期版本的遗留代码
+- 也可能是为未来功能预留的接口
+- 代码注释写 "Used in app/Views/sales/receipt.php"，但实际 receipt.php 调用的是 `/sales/sendPdf/.../receipt`
+
+---
+
+### 4. 自动发送的完整触发条件
+
+自动发送需要同时满足以下所有条件：
+
+1. **配置允许**：`email_receipt_check_behaviour` 不为 `never`
+2. **Session 标记**：`sales_email_receipt` 为 true（或 always 模式）
+3. **客户有邮箱**：`customer_email` 不为空
+4. **页面渲染时变量已注入**：视图中的 `$email_receipt` 和 `$customer_email` 都有值
+
+**自动发送只发生在"结账完成"的场景**（postComplete 返回的页面），查看历史单据时不会自动发送（因为历史查看页面的 `$email_receipt` 由 `_load_sale_data` 构建，该方法内部 `clear_all()` 清空了 Session，所以 `email_receipt` 为 false）。
 
 ---
 
@@ -374,9 +391,13 @@ OSPOS 系统的收据通知功能目前仅支持**邮件**发送，**短信**功
 
 ## 八、潜在问题与注意事项
 
-1. **无发送状态记录**：无法追溯某笔销售的收据是否已发送，也无法防止重复发送
-2. **前端驱动**：邮件发送依赖前端页面加载，如果用户关闭页面则不会发送
-3. **异步失败无感**：自动发送在后台执行，如果失败用户可能没注意到通知
-4. **短信能力缺失**：目前没有短信收据功能，短信模块是独立的
-5. **无重试机制**：发送失败后需要用户手动点击重试，没有自动重试
-6. **无审计日志**：邮件发送没有专门的审计日志，仅记录通用错误日志
+1. **无发送状态记录**：`ospos_sales` 表没有邮件/短信发送状态字段，无法追溯某笔销售的收据是否已发送，也无法防止重复发送
+2. **前端驱动**：邮件发送依赖收据页面加载时的 JS 自动触发，如果用户在页面加载前关闭浏览器则不会发送
+3. **异步失败无感**：自动发送在后台 AJAX 执行，如果失败仅显示顶部通知条，用户可能没注意到
+4. **短信能力缺失**：目前没有短信收据功能，短信模块是独立的通用消息模块，与收据流程无集成
+5. **无重试机制**：发送失败后需要用户手动点击按钮重试，没有自动重试队列
+6. **无审计日志**：邮件发送没有专门的审计日志表，仅在失败时记录通用错误日志
+7. **last 模式跨单记忆偏差**：`email_receipt_check_behaviour=last` 配置注释写"记住上次"，但 `clear_all()` 在销售完成时清空 Session，实际**不会跨单记忆**，仅在同一单多次操作间有效
+8. **多标签页会话冲突**：两个标签页共享 Session，一个标签页的发送邮件操作（内部 clear_all）可能清空另一个标签页正在编辑的销售内容
+9. **展示与发送数据源不一致**：页面展示的是结账时的临时内存数据，邮件里的是数据库回填的数据，虽然正常情况下一致，但存在理论上的不一致窗口
+10. **clear_all() 过度调用**：完成一次结账+发送邮件，会连续调用 3 次 `clear_all()`，虽然结果正确但略显冗余
