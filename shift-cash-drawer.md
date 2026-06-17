@@ -469,11 +469,79 @@ Step 6: _calculate_total() 计算 closed_amount_total
 | 可重复执行 | 仅一次（保存后不再触发） | 每次 keyup 都触发 |
 | 与业务数据一致性 | 强一致（基于真实数据） | 不保证（基于表单值） |
 
-### 7.5 班后手工修正对金额的影响
+### 7.5 服务端自动汇总的字段改写清单（校准）
+
+对照 `Cashups::getView()` 第104-183行的关班自动计算逻辑，把 `ospos_cash_up` 表中的金额字段按"在自动汇总流程中的角色"分为三类，避免把只读输入误当为被重写字段。
+
+#### 7.5.1 被自动重写的字段（输出字段）
+
+这些字段的值由服务端在内存中的 `$cash_ups_info` 对象上**直接赋值/累加**，渲染到表单后随 `postSave()` 一起落库。触发条件为 7.2.1 所述的"四个 closed_amount 全为 0"。
+
+| 字段 | 改写位置（代码行） | 改写方式 | 数据来源 |
+|------|------------------|---------|---------|
+| `close_date` | 第112行 | 覆盖为 `date('Y-m-d H:i:s')` | 系统当前时间 |
+| `closed_amount_cash` | 第115行初始化 → 第152行累加 → 第179行扣减 | `open + transfer` → `+= Summary_payments(cash)` → `-= Expense(cash)` | 开班字段 + 销售汇总 - 现金支出 |
+| `closed_amount_due` | 第154行累加 | `+= Summary_payments(due)` | 销售汇总（应收） |
+| `closed_amount_card` | 第159行累加 | `+= Summary_payments(debit/credit)` | 销售汇总（银行卡） |
+| `closed_amount_check` | 第161行累加 | `+= Summary_payments(check)` | 销售汇总（支票） |
+| `closed_amount_total` | 第182行 | `_calculate_total(...)` 公式计算 | 上述5个字段 + open + transfer |
+
+**注意**：`closed_amount_cash` 是唯一一个被"初始化 + 多次累加 + 扣减"三步复合改写的字段；`closed_amount_due/card/check` 仅做累加（初始值由 `getEmptyObject()` 保证为 0，不显式初始化）；`closed_amount_total` 是最终汇总，依赖前5个字段的最终值。
+
+#### 7.5.2 只作为输入保留的字段（不被自动汇总改写）
+
+这些字段在自动汇总流程中**只读取、不写入**，其值来自开班时保存或用户先前手工录入，自动汇总依赖它们作为计算输入。
+
+| 字段 | 在自动汇总中的角色 | 是否会被覆盖 |
+|------|------------------|-------------|
+| `open_amount_cash` | 第115行作为 `closed_amount_cash` 的初始基数 | 否 不覆盖 |
+| `transfer_amount_cash` | 第115行作为 `closed_amount_cash` 的初始基数；第182行参与 total 公式 | 否 不覆盖 |
+| `open_date` | 第119/139行作为时间范围起点喂给 `Summary_payments::getData()` | 否 不覆盖（仅截断到日期用于查询，不改原值） |
+| `open_employee_id` | 不参与计算 | 否 不覆盖 |
+| `close_employee_id` | 开班时已设，关班时不重新设 | 否 不覆盖 |
+| `note` / `description` / `deleted` | 不参与计算 | 否 不覆盖 |
+
+**关键点**：自动汇总**不会**回写 `open_amount_cash` 或 `transfer_amount_cash`。这意味着如果开班时录入的期初现金或交接金额有误，关班时自动汇总会"带着错误"计算出 `closed_amount_cash`，且事后修改这两个输入字段也不会触发 `closed_amount_cash` 的联动重算（详见 7.6 影响矩阵）。
+
+#### 7.5.3 受前端实时总额计算影响的字段
+
+前端 AJAX（`postAjax_cashup_total()`）只动一个字段：
+
+| 字段 | 是否受 AJAX 影响 | 说明 |
+|------|----------------|------|
+| `closed_amount_total` | 是 唯一被重算 | 每次 keyup 由 `_calculate_total()` 重算并回填显示框 |
+| `open_amount_cash` | 否 仅作为 AJAX 输入 | 读取后送入公式，值不变 |
+| `transfer_amount_cash` | 否 仅作为 AJAX 输入 | 同上 |
+| `closed_amount_cash` | 否 仅作为 AJAX 输入 | 同上（注意 getView 中参数错位，AJAX 中顺序正确） |
+| `closed_amount_due` | 否 仅作为 AJAX 输入 | 同上 |
+| `closed_amount_card` | 否 仅作为 AJAX 输入 | 同上 |
+| `closed_amount_check` | 否 仅作为 AJAX 输入 | 同上 |
+
+**边界确认**：前端 AJAX 计算结果**只更新页面上的 `closed_amount_total` 输入框显示值**，不调用 `postSave()`，不写库。最终是否落库取决于用户是否点击保存按钮（`postSave()` 会原样读取 `$_POST['closed_amount_total']`）。
+
+#### 7.5.4 三类字段对照速查
+
+| 字段 | 自动汇总时 | AJAX 时 | postSave 时 |
+|------|----------|---------|------------|
+| `open_amount_cash` | 输入 | 输入 | 直接存 POST 值 |
+| `transfer_amount_cash` | 输入 | 输入 | 直接存 POST 值 |
+| `closed_amount_cash` | **输出**（复合改写） | 输入 | 直接存 POST 值 |
+| `closed_amount_due` | **输出**（累加） | 输入 | 直接存 POST 值 |
+| `closed_amount_card` | **输出**（累加） | 输入 | 直接存 POST 值 |
+| `closed_amount_check` | **输出**（累加） | 输入 | 直接存 POST 值 |
+| `closed_amount_total` | **输出**（公式） | **输出**（公式） | 直接存 POST 值 |
+| `close_date` | **输出**（当前时间） | — | 直接存 POST 值 |
+
+**核心校准结论**：
+1. 自动汇总的"输出字段"共 **6 个**（`close_date` + 5 个 `closed_amount_*`），其中 `closed_amount_cash` 是唯一被复合改写的字段。
+2. `open_amount_cash` 与 `transfer_amount_cash` **始终只是输入**，无论自动汇总还是 AJAX 都不会被改写，只能由用户手工修改。
+3. `postSave()` 对所有字段一视同仁——直接存 POST 值，不区分是自动算的还是手填的，因此自动汇总的结果最终是否生效完全取决于用户是否在保存前保留了表单上的自动计算值。
+
+### 7.6 班后手工修正对金额的影响
 
 "班后"指班次已保存关班数据（即 closed_amount_* 不全为0）后，再次进入编辑页面进行修改的情形。
 
-#### 7.5.1 修改不同字段的影响矩阵
+#### 7.6.1 修改不同字段的影响矩阵
 
 | 修改的字段 | closed_amount_cash | closed_amount_due | closed_amount_card | closed_amount_check | closed_amount_total | 触发自动重算？ |
 |-----------|--------------------|-------------------|--------------------|---------------------|---------------------|---------------|
@@ -487,7 +555,7 @@ Step 6: _calculate_total() 计算 closed_amount_total
 
 **核心结论**：班后修改 `open_amount_cash` 或 `transfer_amount_cash`，**不会**自动触发 closed_amount_cash 的重新汇总计算。用户必须手动同步修改 closed_amount_cash，否则 total 的计算基于旧的 cash 值，会产生"total 公式对但与实际业务不符"的隐性错误。
 
-#### 7.5.2 典型场景分析
+#### 7.6.2 典型场景分析
 
 **场景1：班后发现 transfer_amount_cash 填错了**
 
@@ -519,7 +587,7 @@ Step 6: _calculate_total() 计算 closed_amount_total
 2. 手动回到班次编辑页修改 closed_amount_cash
 3. total 会 AJAX 自动更新，但 cash 的正确性全靠人工
 
-### 7.6 强制触发重新自动汇总的方法
+### 7.7 强制触发重新自动汇总的方法
 
 如果确实需要基于最新业务数据重新计算关班金额，需要满足"四个 closed_amount 全为0"的条件。实际操作路径：
 
@@ -543,7 +611,7 @@ WHERE cashup_id = {班次ID};
 
 **注意**：重新触发自动汇总后，之前手工修改过的任何 closed_amount 值都会被覆盖为系统计算值。
 
-### 7.7 保存时的行为
+### 7.8 保存时的行为
 
 **入口**：`postSave()` 第206-241行
 
