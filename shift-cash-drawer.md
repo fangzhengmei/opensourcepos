@@ -380,41 +380,183 @@ cash + due = due + cash  （加法交换律）
 - 繁体中文：`進/出現金`
 - 土耳其文：`Nakit Giriş / Çıkış`
 
-**作用**：记录班次之间的现金转移，实现跨班交接。
+**字段本质**：`transfer_amount_cash` 是班次记录上的一个**单体数值字段**，而非独立的转移记录实体。它直接存储在 `ospos_cash_up` 表中，与班次一一绑定。
 
-### 7.2 交接场景与落账逻辑
+### 7.2 代码对该字段的全流程处理
 
-| 场景 | transfer_amount_cash 值 | 对 closed_amount_cash 的影响 |
-|------|-------------------------|------------------------------|
-| 从上个班次接收现金 | 正值（+） | closed_amount_cash 增加 |
-| 向下个班次移交现金 | 负值（-） | closed_amount_cash 减少 |
-| 银行存款/取现 | 正/负 | 相应增减 |
+#### 7.2.1 保存流程（开班时）
 
-### 7.3 交接落账公式
+**入口**：`Cashups::postSave(NEW_ENTRY)`（第206-241行）
 
-**关班时现金基数**（`app/Controllers/Cashups.php`，第115行）：
+```php
+// 第218行：直接从表单读取，不做任何额外处理
+'transfer_amount_cash' => parse_decimals($this->request->getPost('transfer_amount_cash')),
+```
+
+**处理逻辑**：
+1. 从 POST 表单 `transfer_amount_cash` 字段读取原始值
+2. 通过 `parse_decimals()` 将本地化的金额格式（如千分位、货币符号）转换为纯数值
+3. 直接写入 `cash_up_data` 数组，通过 `Cashup::save_value()` 执行 INSERT
+
+**关键结论**：保存时**完全不校验**该值与其他班次的关联性，不做任何正负值限制，也不自动读取上个班次的数据作为默认值。
+
+#### 7.2.2 表单渲染流程
+
+**入口**：`app/Views/cashups/form.php`（第65-82行）
+
+```php
+// 第72-77行：渲染 transfer_amount_cash 输入框
+<?= form_input([
+    'name'  => 'transfer_amount_cash',
+    'id'    => 'transfer_amount_cash',
+    'class' => 'form-control input-sm',
+    'value' => to_currency_no_money($cash_ups_info->transfer_amount_cash)
+]) ?>
+```
+
+**处理逻辑**：
+1. 开班时（NEW_ENTRY）：`$cash_ups_info->transfer_amount_cash` 为 `0`（由 `Cashup::getEmptyObject()` 初始化，第215行）
+2. 关班时：直接回显数据库中该班次已保存的值
+3. 用户可手动输入任意正/负值
+
+**关键结论**：前端表单中，`transfer_amount_cash` 的初始值始终为 `0`（开班）或「本班次之前保存的值」（关班），**不会自动回填**任何来自其他班次的数据。
+
+#### 7.2.3 列表查询流程
+
+**入口**：`Cashup::search()`（第85-159行）
+
+```sql
+-- 第106行：查询中仅做 MAX 聚合，不做跨表关联
+MAX(cash_up.transfer_amount_cash) AS transfer_amount_cash
+```
+
+**列表展示**：`tabular_helper.php` 第903行
+```php
+'transfer_amount_cash' => to_currency($cash_up->transfer_amount_cash),
+```
+
+**关键结论**：查询列表时，`transfer_amount_cash` 仅作为本班次的单体字段展示，**不进行跨班次比对或关联查询**，不会在UI上提示"该值与其他班次是否匹配"。
+
+#### 7.2.4 关班自动计算流程
+
+**入口**：`Cashups::getView($cashup_id)` 关班逻辑（第115行）
+
+```php
+// 第115行：作为现金基数的一部分参与计算
+$cash_ups_info->closed_amount_cash = $cash_ups_info->open_amount_cash + $cash_ups_info->transfer_amount_cash;
+```
+
+后续步骤（第147-180行）：
+1. 在此基数上累加 `Summary_payments` 中的现金销售收入（Cash）
+2. 扣除 `Expense` 中的现金支出
+
+**计算链**：
+```
+closed_amount_cash（关班计算结果）
+    = open_amount_cash + transfer_amount_cash + 本期现金销售收入 - 本期现金支出
+```
+
+**关键结论**：`transfer_amount_cash` 作为计算的"期初调整项"参与关班现金计算，**但其值的正确性完全依赖用户手工输入**，系统不验证来源或去向。
+
+#### 7.2.5 总金额计算中的角色
+
+**两处入口中均正确传递**：`_calculate_total()` 的参数中，`transfer_amount_cash` 始终作为第二个参数传入（不同于 cash/due 的错位问题），不存在顺序不一致。
+
+### 7.3 代码是否自动关联前后班次？——结论
+
+**明确结论：代码完全不做任何自动关联。**
+
+#### 7.3.1 具体证据
+
+| 检查项 | 结论 | 证据位置 |
+|--------|------|---------|
+| 新建班次时自动读取上一班次的 `closed_amount_cash` 作为 `open_amount_cash` 默认值？ | ❌ 否 | `getEmptyObject()` 初始化为0，`getView(NEW_ENTRY)` 中未查询其他班次 |
+| 新建班次时自动读取上一班次的转出金额作为本班次 `transfer_amount_cash` 默认值？ | ❌ 否 | `getView(NEW_ENTRY)` 中无相关逻辑 |
+| 保存时校验本班次的 `transfer_amount_cash` 是否能在其他班次找到对应相反数？ | ❌ 否 | `postSave()` 仅做 `parse_decimals()`，不做跨班次校验 |
+| 是否存在独立的「现金转移记录表」存储配对转移信息？ | ❌ 否 | 数据库仅有 `cash_up` 表单体字段，无 `cash_transfer` 等关联表 |
+| 关班时是否生成下一班次的待匹配记录？ | ❌ 否 | 关班仅 UPDATE 本记录，不 INSERT 任何关联数据 |
+| 列表查询时是否高亮显示"不匹配"的转移金额？ | ❌ 否 | `search()` 方法无跨班次 JOIN 或 HAVING 比对逻辑 |
+
+#### 7.3.2 代码中的相关线索
+
+在 `app/Models/Cashup.php` 的 `$allowedFields`（第20-35行）中可以看到：
+```php
+protected $allowedFields = [
+    'open_date', 'close_date',
+    'open_cash_amount',      // ← 注意：此字段名与数据库列名 open_amount_cash 不一致
+    'transfer_cash_amount',  // ← 注意：此字段名与数据库列名 transfer_amount_cash 不一致
+    'note', ...
+];
+```
+
+`$allowedFields` 中使用了 `open_cash_amount` 和 `transfer_cash_amount`，但实际数据库列名是 `open_amount_cash` 和 `transfer_amount_cash`。虽然 `save_value()` 中使用了自定义 INSERT/UPDATE 而非 CI4 的 `save()` 方法因此不触发错误，但这也反映出该模块在字段命名上存在历史遗留的不一致，进一步说明**跨班关联逻辑未被系统化设计**。
+
+### 7.4 交接场景与实际落账逻辑
+
+| 场景 | 手动操作 | transfer_amount_cash 值 | 对 closed_amount_cash 的影响 |
+|------|---------|-------------------------|------------------------------|
+| 从上个班次接收现金 | 本班次开班时手工填写 | 正值（+） | closed_amount_cash 增加 |
+| 向下个班次移交现金 | 本班次关班时手工填写 | 负值（-） | closed_amount_cash 减少 |
+| 银行存款/取现 | 发生时在当班次填写 | 存（-）/ 取（+） | 相应增减 |
+| 其他现金进出（如备用金） | 手工填写 | 正/负 | 相应增减 |
+
+### 7.5 交接落账公式
+
+**关班时现金基数初始化**（`app/Controllers/Cashups.php`，第115行）：
 ```php
 $cash_ups_info->closed_amount_cash = $cash_ups_info->open_amount_cash + $cash_ups_info->transfer_amount_cash;
 ```
 
 **完整现金计算链**：
 ```
-关班现金 = 开班现金 + 转移金额 + 本期现金销售收入 - 本期现金支出
+关班现金（closed_amount_cash）
+    = 开班现金（open_amount_cash）
+    + 转移金额（transfer_amount_cash）
+    + 本期现金销售收入（Summary_payments 中 Cash 类型汇总）
+    - 本期现金支出（Expense 中仅 Cash 类型汇总）
 ```
 
-### 7.4 跨班交接流程示例
+### 7.6 跨班交接的实际操作模式（非自动化）
+
+由于系统不做自动关联，实际业务中跨班交接必须**完全依赖手工配对操作**：
 
 ```
-班次A（早班）                          班次B（晚班）
-   │                                   │
-   ├─ open_amount_cash = 500           ├─ open_amount_cash = 100
-   ├─ transfer_amount_cash = -400      ├─ transfer_amount_cash = +400
-   │  (移交400给晚班)                   │  (接收早班400)
-   │                                   │
-   └─ closed_amount_cash               └─ closed_amount_cash
-      = 500 + (-400) + 销售 - 支出        = 100 + 400 + 销售 - 支出
-      = 100 + 销售 - 支出                 = 500 + 销售 - 支出
+步骤1：班次A（早班）关班
+   │
+   ├─ 本班次 open_amount_cash = 500
+   ├─ 如需移交 400 给晚班 → 关班时手工填写 transfer_amount_cash = -400
+   ├─ 系统计算 closed_amount_cash = 500 + (-400) + 销售 - 支出
+   └─ 保存关班
+         │
+         ▼
+步骤2：班次B（晚班）开班
+   │
+   ├─ open_amount_cash 默认为 0，需手工填写（如留底100 → 填 100）
+   ├─ 需知道早班移交了 400 → 手工填写 transfer_amount_cash = +400
+   └─ 保存开班
+         │
+         ▼
+步骤3：班次B关班
+   │
+   └─ 系统自动计算 closed_amount_cash = 100 + 400 + 销售 - 支出
 ```
+
+**配对风险**：
+- 若班次A忘记填 `-400`，但班次B填了 `+400` → 两班账目各自不平，系统无任何提示
+- 若班次A填了 `-400`，但班次B填错为 `+4000` → 数值不匹配，系统不告警
+- 若班次A填了 `-400`，班次B忘了填 `+400` → 不匹配，系统不校验
+
+### 7.7 对账目核对的影响
+
+1. **无强制一致性保障**：两个班次之间的转移金额是否相反数，完全依赖人工操作，系统不提供数据库级或应用级的一致性校验。
+
+2. **无法生成配对审计追踪**：由于没有独立的转移记录表，无法查询"哪两个班次之间发生了转移"，也无法查询"某笔转移是否已被对方确认接收"。
+
+3. **期末对账难度**：如果发生转移漏填、错填，只能通过逐班次比对 `transfer_amount_cash` 来人工排查，没有快捷的差异报告。
+
+4. **`description` 字段的实际用途**：由于系统不提供关联机制，实际操作中需要在 `description` 文本字段中用自然语言备注「移交XX给班次Y」或「接收班次X的XX」来辅助人工核对。
+
+5. **修正方式**：若发现之前班次的 transfer 填错，必须重新编辑该班次记录（`postSave($cashup_id)`）进行修正，因为后续班次不会自动联动。修正后若已关班，需要重新进入关班页面触发重新计算（但仅在 `closed_amount_*` 全为0时才会重算，已关班的需先清空金额才能触发，实际操作中通常只能手工修改 closed_amount_cash）。
 
 ---
 
