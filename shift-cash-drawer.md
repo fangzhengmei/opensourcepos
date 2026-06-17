@@ -371,9 +371,199 @@ cash + due = due + cash  （加法交换律）
 
 ---
 
-## 七、跨班交接落账处理
+## 七、关班金额重算边界与手工修正影响
 
-### 7.1 核心字段：`transfer_amount_cash`
+### 7.1 两种计算机制
+
+班次金额计算存在两套独立的机制，触发条件和计算范围完全不同：
+
+| 机制 | 触发方式 | 计算范围 | 数据来源 |
+|------|---------|---------|---------|
+| **服务端自动汇总** | 进入关班页面时，满足条件则自动触发 | 6个金额字段全部重算 | Summary_payments + Expense 真实业务数据 |
+| **前端AJAX实时计算** | 用户修改表单输入框时触发（keyup） | 仅重算 closed_amount_total | 表单上的6个金额字段（纯数学公式） |
+
+### 7.2 服务端自动汇总的触发边界
+
+**入口**：`Cashups::getView($cashup_id)`（第104-183行）
+
+#### 7.2.1 触发条件（全部满足）
+
+```php
+if (
+    floatval($cash_ups_info->closed_amount_cash) == 0
+    && floatval($cash_ups_info->closed_amount_due) == 0
+    && floatval($cash_ups_info->closed_amount_card) == 0
+    && floatval($cash_ups_info->closed_amount_check) == 0
+) {
+    // 执行自动汇总
+}
+```
+
+**四个字段必须全部为 0**（包括 null，因为 `floatval(null) == 0`）。
+
+#### 7.2.2 自动汇总的完整计算流程
+
+```
+Step 1: 设置 close_date = 当前时间
+Step 2: closed_amount_cash = open_amount_cash + transfer_amount_cash
+        （注意：cash初始化为 open+transfer，其他 due/card/check 初始为0）
+Step 3: 构造时间范围 inputs（受 date_or_time_format 配置影响）
+Step 4: Summary_payments::getData() 按支付类型汇总
+        → 分别累加至 closed_amount_cash/due/card/check
+Step 5: Expense::get_payments_summary(only_cash=true) 汇总现金支出
+        → 从 closed_amount_cash 中扣除
+Step 6: _calculate_total() 计算 closed_amount_total
+```
+
+#### 7.2.3 不触发自动汇总的情形
+
+只要四个 closed_amount 字段中**任意一个不为 0**，就**完全跳过**自动汇总：
+
+- 已经保存过关班数据的班次 → 不再重算
+- 用户手工修改过其中任何一个金额并保存 → 不再重算
+- 数据库中因历史数据导致某字段有非零值 → 不再重算
+
+**重要结论**：自动汇总只执行「从零构建」一次，之后就是纯手工维护模式。
+
+### 7.3 前端AJAX实时计算的边界
+
+**入口**：`form.php` 第295-309行 → `Cashups::postAjax_cashup_total()`（第263-275行）
+
+#### 7.3.1 触发条件
+
+6个输入框中任何一个的 `keyup` 事件：
+- `open_amount_cash`
+- `transfer_amount_cash`
+- `closed_amount_cash`
+- `closed_amount_due`
+- `closed_amount_card`
+- `closed_amount_check`
+
+#### 7.3.2 计算范围
+
+**只重算 closed_amount_total**，其他5个输入框的值保持不变。
+
+```
+用户修改任意金额字段 → AJAX提交6个金额 
+    → 服务端 _calculate_total() 纯公式计算 
+        → 返回 total 字符串
+            → 前端更新 closed_amount_total 显示值
+```
+
+#### 7.3.3 关键特征
+
+1. **纯数学公式**：不查询销售、支出等业务数据，仅基于表单上的6个数值
+2. **仅影响显示**：AJAX计算结果只更新页面显示的 `closed_amount_total`，不自动保存到数据库
+3. **保存时原样写入**：`postSave()` 直接读取 `$_POST['closed_amount_total']` 保存，不做校验
+4. **参数顺序正确**：AJAX 调用中 cash 和 due 参数顺序与函数定义一致（不同于 getView 中的错位问题）
+
+### 7.4 两种机制的对比
+
+| 对比项 | 服务端自动汇总 | 前端AJAX实时计算 |
+|--------|-------------|-----------------|
+| 触发时机 | 首次进入关班页面 | 修改任一字段时 |
+| 触发条件 | closed_amount 全为0 | 输入框 keyup 事件 |
+| 数据来源 | 数据库真实销售+支出 | 表单上的6个数值 |
+| 重写字段 | closed_amount_cash/due/card/check/total 全部 | 仅 closed_amount_total |
+| 是否保存 | 需用户提交后才保存 | 不保存，仅显示 |
+| 可重复执行 | 仅一次（保存后不再触发） | 每次 keyup 都触发 |
+| 与业务数据一致性 | 强一致（基于真实数据） | 不保证（基于表单值） |
+
+### 7.5 班后手工修正对金额的影响
+
+"班后"指班次已保存关班数据（即 closed_amount_* 不全为0）后，再次进入编辑页面进行修改的情形。
+
+#### 7.5.1 修改不同字段的影响矩阵
+
+| 修改的字段 | closed_amount_cash | closed_amount_due | closed_amount_card | closed_amount_check | closed_amount_total | 触发自动重算？ |
+|-----------|--------------------|-------------------|--------------------|---------------------|---------------------|---------------|
+| open_amount_cash | ❌ 不变（需手动改） | ❌ 不变 | ❌ 不变 | ❌ 不变 | ✅ AJAX自动重算 | ❌ 否 |
+| transfer_amount_cash | ❌ 不变（需手动改） | ❌ 不变 | ❌ 不变 | ❌ 不变 | ✅ AJAX自动重算 | ❌ 否 |
+| closed_amount_cash | ✅ 用户输入值 | ❌ 不变 | ❌ 不变 | ❌ 不变 | ✅ AJAX自动重算 | ❌ 否 |
+| closed_amount_due | ❌ 不变 | ✅ 用户输入值 | ❌ 不变 | ❌ 不变 | ✅ AJAX自动重算 | ❌ 否 |
+| closed_amount_card | ❌ 不变 | ❌ 不变 | ✅ 用户输入值 | ❌ 不变 | ✅ AJAX自动重算 | ❌ 否 |
+| closed_amount_check | ❌ 不变 | ❌ 不变 | ❌ 不变 | ✅ 用户输入值 | ✅ AJAX自动重算 | ❌ 否 |
+| close_date | ❌ 不变 | ❌ 不变 | ❌ 不变 | ❌ 不变 | ❌ 不变 | ❌ 否 |
+
+**核心结论**：班后修改 `open_amount_cash` 或 `transfer_amount_cash`，**不会**自动触发 closed_amount_cash 的重新汇总计算。用户必须手动同步修改 closed_amount_cash，否则 total 的计算基于旧的 cash 值，会产生"total 公式对但与实际业务不符"的隐性错误。
+
+#### 7.5.2 典型场景分析
+
+**场景1：班后发现 transfer_amount_cash 填错了**
+
+```
+初始状态：
+  open_amount_cash = 500
+  transfer_amount_cash = 0   ← 忘记填交接的 200
+  closed_amount_cash = 1500  ← 已关班时自动计算的值（500+0+销售-支出）
+  closed_amount_total = 1500 - 500 - 0 + ... = 1000
+
+用户操作：
+  进入编辑页面 → 将 transfer_amount_cash 改为 200
+
+实际结果：
+  closed_amount_cash 仍然是 1500 ← 不会自动重算
+  closed_amount_total 变为 1500 - 500 - 200 + ... = 800 ← AJAX 自动改了 total
+  但 cash 的实际构成（500+200+销售-支出=1500 不对，应该是 700+销售-支出）
+  → 账目逻辑自相矛盾
+```
+
+**场景2：班后发现 open_amount_cash 填错了**
+
+类似场景1，修改 open 后 total 会 AJAX 重算，但 closed_amount_cash 本身不变，导致"期末现金 - 期初现金"的差额不真实。
+
+**场景3：班后补填一笔漏记的现金支出**
+
+系统没有提供"添加支出自动刷新 cash"的联动。用户必须：
+1. 手动去支出模块添加支出记录
+2. 手动回到班次编辑页修改 closed_amount_cash
+3. total 会 AJAX 自动更新，但 cash 的正确性全靠人工
+
+### 7.6 强制触发重新自动汇总的方法
+
+如果确实需要基于最新业务数据重新计算关班金额，需要满足"四个 closed_amount 全为0"的条件。实际操作路径：
+
+**方法一：手工清零法（推荐）**
+1. 进入班次编辑页面
+2. 手动将 `closed_amount_cash`、`closed_amount_due`、`closed_amount_card`、`closed_amount_check` 四个字段全部改为 0
+3. 保存
+4. 再次进入该班次编辑页面 → 触发自动重算
+
+**方法二：数据库直接更新法**
+```sql
+UPDATE cash_up 
+SET closed_amount_cash = 0, 
+    closed_amount_due = 0,
+    closed_amount_card = 0,
+    closed_amount_check = 0,
+    closed_amount_total = 0
+WHERE cashup_id = {班次ID};
+```
+然后在前端重新进入编辑页面。
+
+**注意**：重新触发自动汇总后，之前手工修改过的任何 closed_amount 值都会被覆盖为系统计算值。
+
+### 7.7 保存时的行为
+
+**入口**：`postSave()` 第206-241行
+
+保存逻辑非常"透明"——不做任何校验或重算：
+
+1. 从 `$_POST` 读取所有12个字段的值
+2. `parse_decimals()` 格式化金额
+3. 直接调用 `Cashup::save_value()` 执行 INSERT 或 UPDATE
+
+**关键点**：
+- `closed_amount_total` 直接保存 POST 过来的值，不重新调用 `_calculate_total()` 校验
+- 没有一致性校验（如 total 是否等于 cash - open - transfer + due + card + check）
+- 没有业务校验（如 cash 是否等于 open + transfer + 销售 - 支出）
+- 完全信任前端传来的数据
+
+---
+
+## 八、跨班交接落账处理
+
+### 8.1 核心字段：`transfer_amount_cash`
 
 **业务含义**（来自多语言文件）：
 - 英文：`In/Out Cash`（现金进/出）
@@ -382,9 +572,9 @@ cash + due = due + cash  （加法交换律）
 
 **字段本质**：`transfer_amount_cash` 是班次记录上的一个**单体数值字段**，而非独立的转移记录实体。它直接存储在 `ospos_cash_up` 表中，与班次一一绑定。
 
-### 7.2 代码对该字段的全流程处理
+### 8.2 代码对该字段的全流程处理
 
-#### 7.2.1 保存流程（开班时）
+#### 8.2.1 保存流程（开班时）
 
 **入口**：`Cashups::postSave(NEW_ENTRY)`（第206-241行）
 
@@ -400,7 +590,7 @@ cash + due = due + cash  （加法交换律）
 
 **关键结论**：保存时**完全不校验**该值与其他班次的关联性，不做任何正负值限制，也不自动读取上个班次的数据作为默认值。
 
-#### 7.2.2 表单渲染流程
+#### 8.2.2 表单渲染流程
 
 **入口**：`app/Views/cashups/form.php`（第65-82行）
 
@@ -421,7 +611,7 @@ cash + due = due + cash  （加法交换律）
 
 **关键结论**：前端表单中，`transfer_amount_cash` 的初始值始终为 `0`（开班）或「本班次之前保存的值」（关班），**不会自动回填**任何来自其他班次的数据。
 
-#### 7.2.3 列表查询流程
+#### 8.2.3 列表查询流程
 
 **入口**：`Cashup::search()`（第85-159行）
 
@@ -437,7 +627,7 @@ MAX(cash_up.transfer_amount_cash) AS transfer_amount_cash
 
 **关键结论**：查询列表时，`transfer_amount_cash` 仅作为本班次的单体字段展示，**不进行跨班次比对或关联查询**，不会在UI上提示"该值与其他班次是否匹配"。
 
-#### 7.2.4 关班自动计算流程
+#### 8.2.4 关班自动计算流程
 
 **入口**：`Cashups::getView($cashup_id)` 关班逻辑（第115行）
 
@@ -458,15 +648,15 @@ closed_amount_cash（关班计算结果）
 
 **关键结论**：`transfer_amount_cash` 作为计算的"期初调整项"参与关班现金计算，**但其值的正确性完全依赖用户手工输入**，系统不验证来源或去向。
 
-#### 7.2.5 总金额计算中的角色
+#### 8.2.5 总金额计算中的角色
 
 **两处入口中均正确传递**：`_calculate_total()` 的参数中，`transfer_amount_cash` 始终作为第二个参数传入（不同于 cash/due 的错位问题），不存在顺序不一致。
 
-### 7.3 代码是否自动关联前后班次？——结论
+### 8.3 代码是否自动关联前后班次？结论
 
 **明确结论：代码完全不做任何自动关联。**
 
-#### 7.3.1 具体证据
+#### 8.3.1 具体证据
 
 | 检查项 | 结论 | 证据位置 |
 |--------|------|---------|
@@ -477,7 +667,7 @@ closed_amount_cash（关班计算结果）
 | 关班时是否生成下一班次的待匹配记录？ | ❌ 否 | 关班仅 UPDATE 本记录，不 INSERT 任何关联数据 |
 | 列表查询时是否高亮显示"不匹配"的转移金额？ | ❌ 否 | `search()` 方法无跨班次 JOIN 或 HAVING 比对逻辑 |
 
-#### 7.3.2 代码中的相关线索
+#### 8.3.2 代码中的相关线索
 
 在 `app/Models/Cashup.php` 的 `$allowedFields`（第20-35行）中可以看到：
 ```php
@@ -491,7 +681,7 @@ protected $allowedFields = [
 
 `$allowedFields` 中使用了 `open_cash_amount` 和 `transfer_cash_amount`，但实际数据库列名是 `open_amount_cash` 和 `transfer_amount_cash`。虽然 `save_value()` 中使用了自定义 INSERT/UPDATE 而非 CI4 的 `save()` 方法因此不触发错误，但这也反映出该模块在字段命名上存在历史遗留的不一致，进一步说明**跨班关联逻辑未被系统化设计**。
 
-### 7.4 交接场景与实际落账逻辑
+### 8.4 交接场景与实际落账逻辑
 
 | 场景 | 手动操作 | transfer_amount_cash 值 | 对 closed_amount_cash 的影响 |
 |------|---------|-------------------------|------------------------------|
@@ -500,7 +690,7 @@ protected $allowedFields = [
 | 银行存款/取现 | 发生时在当班次填写 | 存（-）/ 取（+） | 相应增减 |
 | 其他现金进出（如备用金） | 手工填写 | 正/负 | 相应增减 |
 
-### 7.5 交接落账公式
+### 8.5 交接落账公式
 
 **关班时现金基数初始化**（`app/Controllers/Cashups.php`，第115行）：
 ```php
@@ -516,7 +706,7 @@ $cash_ups_info->closed_amount_cash = $cash_ups_info->open_amount_cash + $cash_up
     - 本期现金支出（Expense 中仅 Cash 类型汇总）
 ```
 
-### 7.6 跨班交接的实际操作模式（非自动化）
+### 8.6 跨班交接的实际操作模式（非自动化）
 
 由于系统不做自动关联，实际业务中跨班交接必须**完全依赖手工配对操作**：
 
@@ -546,7 +736,7 @@ $cash_ups_info->closed_amount_cash = $cash_ups_info->open_amount_cash + $cash_up
 - 若班次A填了 `-400`，但班次B填错为 `+4000` → 数值不匹配，系统不告警
 - 若班次A填了 `-400`，班次B忘了填 `+400` → 不匹配，系统不校验
 
-### 7.7 对账目核对的影响
+### 8.7 对账目核对的影响
 
 1. **无强制一致性保障**：两个班次之间的转移金额是否相反数，完全依赖人工操作，系统不提供数据库级或应用级的一致性校验。
 
@@ -560,9 +750,9 @@ $cash_ups_info->closed_amount_cash = $cash_ups_info->open_amount_cash + $cash_up
 
 ---
 
-## 八、关班对账数据来源详解
+## 九、关班对账数据来源详解
 
-### 8.1 Summary_payments 支付汇总
+### 9.1 Summary_payments 支付汇总
 
 **SQL查询逻辑**（`app/Models/Reports/Summary_payments.php`，第85-101行）：
 
@@ -585,7 +775,7 @@ GROUP BY sales_payments.payment_type
 - `sumpay_items_temp`：销售商品金额临时表（含折扣计算）
 - `sumpay_payments_temp`：支付金额临时表
 
-### 8.2 Expense 现金支出汇总
+### 9.2 Expense 现金支出汇总
 
 **SQL查询逻辑**（`app/Models/Expense.php`，第306-338行）：
 
@@ -604,9 +794,9 @@ GROUP BY payment_type
 
 ---
 
-## 九、完整调用链路
+## 十、完整调用链路
 
-### 9.1 开班链路
+### 10.1 开班链路
 
 ```
 Cashups::getIndex()
@@ -624,7 +814,7 @@ Cashups::postSave(NEW_ENTRY)
         └─ INSERT INTO cash_up
 ```
 
-### 9.2 关班链路
+### 10.2 关班链路
 
 ```
 Cashups::getView($cashup_id)
@@ -653,7 +843,7 @@ Cashups::postSave($cashup_id)
 
 ---
 
-## 十、关键注意事项
+## 十一、关键注意事项
 
 1. **关班判定条件**：只有当所有 `closed_amount_*` 字段均为 0 时才会自动计算。如果用户曾经保存过半完成的关班数据，后续进入时不会重新计算。
 
@@ -666,3 +856,14 @@ Cashups::postSave($cashup_id)
 5. **软删除**：班次记录通过 `deleted` 字段软删除，而非物理删除。
 
 6. **参数顺序不一致（重要）**：`_calculate_total()` 函数在 `getView()` 和 `postAjax_cashup_total()` 两处调用中，cash 和 due 参数的传递顺序相反。当前因加法交换律数值结果一致，但存在维护风险，详见第六章。
+
+7. **关班重算边界清晰（重要）**：服务端自动汇总仅在四个 `closed_amount_*` 全为0时触发一次，之后所有修改均为手工维护；前端 AJAX 仅实时重算 `closed_amount_total`，不触动其他金额。修改 `open_amount_cash` 或 `transfer_amount_cash` 后，`closed_amount_cash` 不会自动联动更新，详见第七章。
+
+8. **跨班交接无自动化（重要）**：`transfer_amount_cash` 字段完全由用户手动输入，系统不执行以下任何操作：
+   - 不自动读取上一班次的结余作为下一班次的开班现金默认值
+   - 不校验相邻班次的 transfer 值是否互为相反数
+   - 不生成配对的转移记录
+   - 不在列表中高亮不匹配的转移金额
+   实际操作中需在 `description` 字段中备注交接信息辅助人工核对，详见第八章。
+
+9. **已关班次修正困难**：已保存关班数据后，若发现 `open_amount_cash` 或 `transfer_amount_cash` 有误，修改后不会触发自动重算（因为 `closed_amount_*` 不全为0），需要手动修正 `closed_amount_cash` 或先清空所有 closed_amount 字段再重新进入关班页面。
