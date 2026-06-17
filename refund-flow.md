@@ -7,12 +7,13 @@
 
 ## 0. 整体脉络
 
-退货复用 `Sales` 控制器的销售登记页（register）。操作链路有两条入口：
+退货复用 `Sales` 控制器的销售登记页（register）。操作链路有三条入口：
 
 1. 切换为退货模式 → `app/Controllers/Sales.php:254-296`（`postChangeMode`）把 `sales_mode` 设为 `return`、`sale_type` 设为 `SALE_TYPE_RETURN`。
-2. 退货模式下输入内容分两种：
+2. 退货模式下输入内容分三种：
    - **路径 A（整单回填）**：输入原收据号 → `getItemSearch` 校验合法后，`postAdd` 命中 `return_entire_sale`，把原单商品以 **负数量** 装回购物车。
    - **路径 B（无收据 / 部分退货）**：直接输入商品条码 → 不走收据校验，`postAdd` 在退货模式下先把数量取负，再走普通 `add_item`，直接形成负数量退货项。
+   - **路径 C（套件退货）**：输入套件编号（KIT #）→ 主商品（kit_item）数量取负，组成项数量在 `add_item_kit` 内部读取套件配置时为正，出现符号分裂。
 3. 录入退款支付 → `app/Controllers/Sales.php:393-472`（`postAddPayment`，支付金额可为负，或靠 `cash_refund` 找零退款）。
 4. 完成交易 → `app/Controllers/Sales.php:691-923`（`postComplete`）调 `app/Models/Sale.php:518-688`（`save_value`）一次性写库，库存/支付/积分全部在此反转。
 
@@ -23,14 +24,17 @@ postChangeMode(return)
         ├─ 路径A：输入收据号 ──getItemSearch──▶ isValidReceipt──▶ 建议列表提示
         │                       └─ postAdd ──return_entire_sale──▶ 购物车(数量取负) ──▶ set_customer(原客户)
         │
-        └─ 路径B：直接输商品 ──postAdd──▶ quantity = -quantity ──▶ add_item(负数量) ──▶ 购物车(局部负项)
+        ├─ 路径B：直接输商品 ──postAdd──▶ quantity = -quantity ──▶ add_item(负数量) ──▶ 购物车(局部负项)
+        │
+        └─ 路径C：输套件编号 ──postAdd──┬─ 主商品 kit_item: quantity 已取负 ──▶ add_item(负数量)
+                                      └─ 组成项: add_item_kit 内部 quantity>0 ──▶ add_item(正数量)
                                                 │
 postAddPayment ◀─────────────────────────────────┘
      │
 postComplete ──▶ Sale::save_value
-        ├─ sales_items   (quantity_purchased < 0)
-        ├─ item_quantity (quantity - 负数 = 回补)
-        ├─ inventory     (trans_inventory = -负数 = 入库)
+        ├─ sales_items   (kit_item 负, component 正)
+        ├─ item_quantity (仅 HAS_STOCK 项: 负数量回补, 正数量扣减 → 相互抵消)
+        ├─ inventory     (同上, 流水也一正一负抵消)
         ├─ sales_payments(payment_amount / cash_refund)
         ├─ giftcard / rewards 余额回冲
         └─ save_customer_rewards(earned 取负 → 扣回已赠积分)
@@ -84,7 +88,7 @@ $quantity = ($mode == 'return') ? -$quantity : $quantity;   // L525 —— 退�
 if ($mode == 'return' && $this->sale->isValidReceipt(...)) {
     $this->sale_lib->return_entire_sale(...);               // 路径 A：整单回填
 } elseif ($this->item_kit->is_valid_item_kit(...)) {
-    ... 套件处理（数量同样为负）
+    ... 套件处理（主商品 quantity 已取负，组成项 quantity 不变仍为正）
 } else {
     $this->sale_lib->add_item(...);                         // 路径 B：普通商品，数量为负
 }
@@ -96,9 +100,52 @@ if ($mode == 'return' && $this->sale->isValidReceipt(...)) {
 - `else` 分支里调用的是 `add_item`——和正常销售完全相同的函数，只是传进去的 `quantity` 为负。`add_item` 本身不校验是否在退货模式，也不校验该商品是否出自某张原收据。
 - 这意味着：**只要切换到退货模式，扫码任意在售商品，都能形成一笔负数量退货并正常完成**，不需要任何原始收据做支撑。合法收据校验只是为了把原单整单"镜像"回购物车，节省手工录入，并不是退货权限的闸门。
 
+### 1.5 套件退货（路径 C：主商品负、组成项正的符号分裂）
+
+套件退货是三条路径里**唯一不一定全为负数量**的情况，也是符号分裂的根源。代码位于 `app/Controllers/Sales.php:530-565`（`postAdd` 的 `elseif` 分支），处理分两步：
+
+**第一步：添加主商品（kit_item）→ 数量为负**
+
+`app/Controllers/Sales.php:551-557` 先处理 `kit_item_id`（套件自身的代表商品），传入的 `$quantity` 已经在 L525 被取负，因此主商品购物车项 `quantity < 0`：
+
+```php
+if (!empty($kit_item_id)) {
+    if (!$this->sale_lib->add_item($kit_item_id, $item_location, $quantity, $discount, $discount_type, PRICE_MODE_KIT, ...)) {
+```
+
+主商品的 `price_mode = PRICE_MODE_KIT`，价格是否为 0 取决于 `kit_price_option`（`app/Libraries/Sale_lib.php:1055-1062`）。如果配置为"套件统一定价"，主商品价格为套件总价、组成项价格归零；如果配置为"分项计价"，则主商品价格归零、组成项各有价格。无论哪种定价模式，**主商品的 `quantity` 符号由 L525 决定，为负**。
+
+**第二步：添加组成项（components）→ 数量为正**
+
+`app/Controllers/Sales.php:561` 调用 `add_item_kit`，**没有把取负后的 `$quantity` 传进去**——这是符号分裂的关键：
+
+```php
+if (!$this->sale_lib->add_item_kit($item_id_or_number_or_item_kit_or_receipt, $item_location, $discount, $discount_type, $kit_price_option, $kit_print_option, $stock_warning)) {
+```
+
+在 `app/Libraries/Sale_lib.php:1334-1351`（`add_item_kit`）内部，遍历套件定义读取的 `$item_kit_item['quantity']` 是**套件配置中的原始正数**（例如"1 个汉堡套件 = 2 个面包 + 1 个肉饼"，这里的 2 和 1 都是正数）。它没有被外层的 L525 取负逻辑影响，直接以正数量传给 `add_item`：
+
+```php
+foreach ($this->item_kit_items->get_info($item_kit_id) as $item_kit_item) {
+    $result &= $this->add_item($item_kit_item['item_id'], $item_location, $item_kit_item['quantity'], ...);
+    //                                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    //                                                     套件配置中的原始正数，未被取负
+}
+```
+
+最终购物车里出现**符号分裂**的两条（或更多）记录：
+
+| 角色 | 商品 | quantity 符号 | 来源 |
+|---|---|---|---|
+| 主商品 | kit_item | **负** | 外层 L525 `$quantity = -$quantity` |
+| 组成项 1 | component A | **正** | `add_item_kit` 内部读取套件配置的原始正数 |
+| 组成项 2 | component B | **正** | 同上 |
+
+> 注意：整单回填（路径 A）如果原单含套件，走的是 `return_entire_sale` 把原单 `sales_items` 逐行 `-$row->quantity_purchased` 重新 `add_item`，**不会触发路径 C 的符号分裂**。只有手动输入 `KIT #` 走套件退货时才会出现此现象。
+
 ---
 
-## 2. 库存回补：负数量如何把货加回去
+## 2. 库存回补：负数量如何把货加回去（含套件的符号分裂处理）
 
 库存的回补发生在 `app/Models/Sale.php:518-688`（`save_value`）的明细循环里。整段在一个数据库事务内（`transStart`/`transComplete`）。
 
@@ -110,7 +157,7 @@ if ($cur_item_info->stock_type == HAS_STOCK && $sale_status == COMPLETED) { ... 
 
 > 退货时 `sale_status` 仍为 `COMPLETED`（见 `app/Controllers/Sales.php:893-900`（`postComplete`）的 `else` 分支），因此库存逻辑会执行。
 
-回补的"负负得正"机制：
+### 2.1 普通退货（路径 A/B）：负负得正
 
 - **库存余量**：读取当前余量后写回 `quantity - $item_data['quantity']`（`app/Models/Sale.php:639-647`）。退货时 `quantity` 为负，`减负数 = 加回库存`。
 - **商品复活**：若 `quantity < 0` 触发 `$item->undelete()`（`app/Models/Sale.php:650-652`），把退货时已软删的商品恢复。
@@ -118,21 +165,77 @@ if ($cur_item_info->stock_type == HAS_STOCK && $sale_status == COMPLETED) { ... 
 
 `sales_items` 表里同样保存 `quantity_purchased` 为负（`app/Models/Sale.php:617-633`），是报表层"退货"统计的数据源。
 
+### 2.2 套件退货（路径 C）：主商品与组成项相互抵消
+
+套件退货的符号分裂（主商品负、组成项正）在库存层有特殊表现。关键在于主商品（kit_item）和组成项（components）的 **`stock_type` 配置不同**，导致是否进入库存逻辑分支、以及进入后的符号方向都不同。
+
+#### 情形 1：主商品 stock_type != HAS_STOCK（最常见）
+
+主商品通常是"非库存商品"（`stock_type = NON_STOCK`，即套件只是虚拟组合，不独立持有库存）。此时 `app/Models/Sale.php:635` 的条件不成立，主商品 **跳过库存处理**，不会产生任何库存变动。
+
+组成项通常是"库存商品"（`stock_type = HAS_STOCK`），它们的 `quantity` 为正 → 进入库存分支后：
+
+- 余量：`quantity - 正数 = 减少库存`（相当于正常扣减）
+- 流水：`trans_inventory = -正数 = 负`（出库流水）
+
+**结果**：主商品是虚拟项无库存变化，组成项却在做**正向扣减**——这与"退货应该回补库存"的直觉相反。实际中只有**整单回填（路径 A）退货套件**时正确，因为原单明细里组成项也为负，重新 `-$row->quantity_purchased` 后组成项为正，但主商品可能根本不在原单里（取决于套件打印/保存配置），所以不会产生符号分裂。
+
+> 这是一个值得注意的设计特征：手动 `KIT #` 套件退货（路径 C）在库存层实际上可能把组成项的库存**扣减**了，而不是回补。除非 kit_item 本身配置为 HAS_STOCK（见下）。
+
+#### 情形 2：主商品 stock_type == HAS_STOCK（较少见）
+
+如果 kit_item 本身是持有库存的真实商品（`HAS_STOCK`），则主商品 `quantity < 0` 会走正常的"负负得正"回补逻辑：
+
+- 主商品：`quantity - 负数 = 回补库存`（加回）
+- 组成项：`quantity - 正数 = 扣减库存`（减去）
+
+如果套件定义是"1 个 kit_item = 2 个 compA + 1 个 compB"，则 kit_item 回补 1 件，compA 扣减 2 件，compB 扣减 1 件——这相当于"拆套件回收入库"，即把组合好的套件拆回散件。是否符合业务预期取决于套件是否预先组装。
+
+#### 情形 3：组成项为非库存商品（stock_type != HAS_STOCK）
+
+如果某个组成项是非库存商品（例如服务费、虚拟商品），它同样跳过 `HAS_STOCK` 分支，不产生库存变动，仅在 `sales_items` 留痕。
+
+### 2.3 商品复活的不对称性
+
+`app/Models/Sale.php:650-652` 的 `undelete` 逻辑只判断 `quantity < 0`。在套件退货中：
+
+- 主商品 `quantity < 0` → 可能触发 `undelete`（如果已被软删）
+- 组成项 `quantity > 0` → 不会触发 `undelete`
+
+如果主商品被软删过，退货时会被复活；组成项则不会——这也是符号分裂带来的不对称行为。
+
 ---
 
-## 3. 支付逆向：退款如何落到支付记录
+## 3. 支付逆向：退款如何落到支付记录（含套件金额的符号来源）
 
 退货总额为负（数量取负 → `get_extended_amount` 的 `bcmul(quantity, price)` 为负，见 `app/Libraries/Sale_lib.php:1609-1614`（`get_extended_amount`））。退款有两条路径：**现金找零退款（cash_refund）** 与 **负额支付**。
 
-### 3.1 总额与找零方向
+### 3.1 总额与找零方向（含套件对金额符号的影响）
 
-`app/Libraries/Sale_lib.php:694-783`（`get_totals`）计算出负的 `total`、负的 `amount_due`。退货时"支付是否覆盖总额"的判定是 **反向** 的（`app/Libraries/Sale_lib.php:766-770`）：
+`app/Libraries/Sale_lib.php:694-783`（`get_totals`）遍历购物车累加金额，不区分 item_type，只按 `quantity × price` 计算。这意味着：
+
+- **普通退货（A/B）**：所有项 `quantity < 0`，累加后 `total < 0`、`amount_due < 0`。
+- **套件退货（C）**：金额符号取决于谁在"承担金额"。金额由 `PRICE_MODE_KIT` 下的 `kit_price_option` 决定（`app/Libraries/Sale_lib.php:1055-1062`）：
+
+| kit_price_option 配置 | 谁承担金额 | 主商品 quantity | 主商品 price | 组成项 quantity | 组成项 price | 金额合计 |
+|---|---|---|---|---|---|---|
+| PRICE_OPTION_KIT（套件统一定价） | 主商品 | 负（L525） | = 套件总价 | 正（配置） | = 0 | **负**（主商品负 × 正价） |
+| PRICE_OPTION_ALL（分项计价） | 组成项 | 负（L525） | = 0 | 正（配置） | = 分项单价 | **正**（组成项正 × 正价） |
+| PRICE_OPTION_KIT_STOCK | 库存组成项 | 负（L525） | 库存项有价格 | 正（配置） | 非库存项 0 | 取决于库存组成项价 × 正数量 |
+
+**关键结论**：套件退货（路径 C）**不一定产生负总额**。当配置为 `PRICE_OPTION_ALL`（分项计价）时，组成项 `quantity > 0` × `price > 0` → 金额为正，主商品价格归零 → 购物车合计为**正**，这会让 `amount_due > 0`，表现为"应该向客户收钱"而非退款，与退货语义相反。
+
+退货时"支付是否覆盖总额"的判定在 `app/Libraries/Sale_lib.php:766-770`，但这条判定只看 `mode == 'return'`，**不关心总额实际符号**：
 
 ```php
 if ($this->get_mode() == 'return') {
     $totals['payments_cover_total'] = $current_due > -$threshold; // 从负侧逼近 0
 }
 ```
+
+如果套件退货（路径 C）产生了**正总额**，`current_due = total - payment_total` 为正，那么 `current_due > -$threshold` 几乎总是成立（正数一定大于负数阈值），所以 `payments_cover_total` 会被误判为 `true`，允许完成交易——但此时 `amount_due > 0`，意味着系统认为客户**还需付钱**，逻辑上与退货相悖。
+
+**修正提示**：`postComplete` 的 L758-L761 只拦截"非退货模式下的负总额"，对退货模式的正总额没有对称拦截。如果业务上要防止套件退货产生正向收费，需要在这里加一条对称判断。
 
 ### 3.2 cash_refund：现金退款主通道
 
@@ -165,9 +268,9 @@ $total_amount = payment_amount - cash_refund;   // 退款时呈负
 
 ---
 
-## 4. 积分回收：已赠积分如何扣回
+## 4. 积分回收：已赠积分如何扣回（含套件符号分裂的影响）
 
-积分在退货中分两路回收，均在 `save_value` 的事务内。
+积分在退货中分两路回收，均在 `save_value` 的事务内。计算依据是 `payment_amount`（用于"用作支付的积分"）和 `total_amount`（用于"销售赠送的积分"），两者都**不受 item 级符号分裂直接影响**，但最终符号由购物车总额决定。
 
 ### 4.1 退还"用作支付的积分"
 
@@ -181,21 +284,28 @@ $total_amount_used += $payment['payment_amount'];   // 退货为负
 
 退货支付金额为负 → `points - 负 = points + |额|`，把原单用作支付的积分 **加回** 客户账户（落库见 `app/Models/Customer.php:239-244` `update_reward_points_value`）。
 
+> 套件退货（路径 C）不影响这一路，因为它只看支付记录，支付记录的符号是客户在 `postAddPayment` 录入时决定的。
+
 ### 4.2 扣回"销售赠送的积分"
 
 `app/Models/Sale.php:1377-1403`（`save_customer_rewards`，在 `save_value:606` 调用）：
 
 ```php
-$total_amount_earned = $total_amount * $points_percent / 100;  // total_amount 为负 → earned 为负
-$points = $points + $total_amount_earned;                      // 累加负值 → 扣减
+$total_amount_earned = $total_amount * $points_percent / 100;  // total_amount 符号决定 earned 符号
+$points = $points + $total_amount_earned;
 customer->update_reward_points_value($customer_id, $points);
 rewards->save_value(['sale_id'=>.., 'earned'=>$total_amount_earned, 'used'=>$total_amount_used]);
 ```
 
-- `$total_amount` 是上一节算出的"退款总额"（负）→ `earned` 为负 → 客户积分 **减少**，回收原单按比例赠送的积分。
-- 同时向 `sales_reward_points` 写入一条记录（`app/Models/Rewards.php:26-42` `save_value`），`earned` 为负、`used` 为负，完整留痕。
+这里的 `$total_amount` 是上一节 `payment_amount - cash_refund` 的汇总。它的符号在套件退货（路径 C）场景下取决于购物车总额的符号：
 
-> 两路合起来：原单"用积分抵扣"的部分被退回账户，原单"按消费额获赠"的部分被反向扣除，闭环一致。
+- 普通退货（A/B）：`total < 0` → `earned < 0` → 客户积分减少（正常扣回赠送积分）。
+- 套件退货（C）- PRICE_OPTION_KIT：`total < 0` → 同上正常扣回。
+- 套件退货（C）- PRICE_OPTION_ALL：`total > 0` → `earned > 0` → 客户积分**反而增加**，等于"退了套件还送积分"——与退货语义完全相反。
+
+同时向 `sales_reward_points` 写入一条记录（`app/Models/Rewards.php:26-42` `save_value`），`earned` 和 `used` 的符号跟随 `total_amount` 和 `payment_amount`。
+
+> 两路合起来：原单"用积分抵扣"的部分被退回账户，原单"按消费额获赠"的部分被反向扣除——**但在套件退货且分项计价时，第二路会反向增加积分**，是符号分裂引发的另一个不一致点。
 
 ---
 
@@ -220,10 +330,11 @@ rewards->save_value(['sale_id'=>.., 'earned'=>$total_amount_earned, 'used'=>$tot
 - 模式判断：`app/Libraries/Sale_lib.php:471-474`（`is_return_mode`）、`app/Libraries/Sale_lib.php:862`（`get_mode`）
 - 收据搜索建议：`app/Controllers/Sales.php:194-209`（`getItemSearch`）
 - 收据校验：`app/Models/Sale.php:414-436`（`isValidReceipt`）
-- 添加商品（含两条退货入口）：`app/Controllers/Sales.php:503-575`（`postAdd`）
+- 添加商品（含三条退货入口）：`app/Controllers/Sales.php:503-575`（`postAdd`）
 - 整单回填：`app/Libraries/Sale_lib.php:1308-1322`（`return_entire_sale`）
 - 原单明细查询：`app/Models/Sale.php:855`（`get_sale_items_ordered`）
 - 加商品到购物车（负数量也走这里）：`app/Libraries/Sale_lib.php:1034`（`add_item`）
+- 套件组成项添加（数量未取负的关键）：`app/Libraries/Sale_lib.php:1334-1351`（`add_item_kit`）
 - 完成/落库：`app/Controllers/Sales.php:691-923`（`postComplete`）、`app/Models/Sale.php:518-688`（`save_value`）
 - 支付录入：`app/Controllers/Sales.php:393-472`（`postAddPayment`）
 - 支付编辑/事后退款：`app/Controllers/Sales.php:1444-1529`（`postSave`）、`app/Models/Sale.php:452`（`update`）
